@@ -7,7 +7,8 @@
 #   - 每个交易日盘后 16:00 (北京时间) 自动运行
 #   - 非交易日自动跳过 (节省 Actions 额度)
 #   - 数据源故障自动切换 (Baostock TCP → AkShare → efinance → 东财/腾讯/新浪HTTP)
-#   - 涨幅过滤: 只扫描涨幅 > 5% 的股票 (5000+ → 几十~两百家, 大幅提速)
+#   - 涨停股扫描: 只扫描涨停股 (~20-100 只, 极速扫描)
+#   - 数据源故障自动切换 (Baostock TCP → AkShare → efinance → 东财/腾讯/新浪HTTP)
 #   - 多线程并发抓取K线 (10 线程, Baostock 每个 worker 独立 TCP 连接)
 #   - 运行后自动清理临时文件 (防止 artifact 膨胀)
 #   - 失败自动重试 1 次
@@ -91,6 +92,7 @@ jobs:
       BOLLINGER_EXPLODE_RATIO: '1.5'
       CANDLE_BODY_MIN_PCT: '3.0'
       MIN_CHANGE_PCT: '5.0'
+      SCAN_ZT_ONLY: '1'
       RSI_LOWER: '50'
       RSI_UPPER: '85'
 

@@ -108,8 +108,10 @@ def run_pipeline(force: bool = False, dry_run: bool = False):
     bollinger_explode_ratio = float(os.getenv("BOLLINGER_EXPLODE_RATIO", "1.5"))
     candle_body_min_pct = float(os.getenv("CANDLE_BODY_MIN_PCT", "3.0"))
     min_change_pct = float(os.getenv("MIN_CHANGE_PCT", "5.0"))
+    scan_zt_only = os.getenv("SCAN_ZT_ONLY", "1").lower() in ("1", "true", "yes", "on")
 
-    logger.info("配置加载 | 市场={} 范围={} 模式={} 强制={} 涨幅过滤={}%", market, scan_scope, run_mode, force, min_change_pct)
+    scan_mode = "涨停股" if scan_zt_only else f"涨幅>{min_change_pct}%"
+    logger.info("配置加载 | 市场={} 范围={} 模式={} 强制={} 扫描模式={}", market, scan_scope, run_mode, force, scan_mode)
 
     # ============================================================
     # Pre-Flight: 交易日判断 + 磁盘空间检查
@@ -168,19 +170,19 @@ def run_pipeline(force: bool = False, dry_run: bool = False):
         logger.info("使用自定义股票池: {} 只", len(stock_list))
     else:
         try:
-            stock_list = etl.get_stock_list(min_change_pct=min_change_pct)
+            stock_list = etl.get_stock_list(min_change_pct=min_change_pct, zt_only=scan_zt_only)
         except Exception as e:
             logger.error("获取股票列表时发生异常: {}", e)
             stock_list = []
 
     # 数据源连接失败时优雅退出, 不崩溃
     if not stock_list:
-        logger.error("数据源连接失败或无涨幅达标股票，本次扫描跳过")
+        logger.error("数据源连接失败或无达标股票，本次扫描跳过")
         if not dry_run:
             _send_data_failure_alert(market)
         return None
 
-    logger.info("涨幅 > {}% 的股票: {} 只 (已剔除科创板/北交所/ST)", min_change_pct, len(stock_list))
+    logger.info("{}股票: {} 只 (已剔除科创板/北交所/ST)", scan_mode, len(stock_list))
 
     # 获取 120 日数据 (MA60 需要 60 日 + VCP 需要约 50 日窗口 + 余量)
     stock_data = etl.batch_fetch(stock_list, days=120)

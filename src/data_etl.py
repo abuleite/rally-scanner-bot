@@ -919,6 +919,190 @@ class DataETL:
         self._mark_source_success("baostock")
         return df
 
+    # ============================================================
+    # 涨停股获取 (只扫描涨停股, 数量少 ~20-100 只, 扫描极快)
+    # ============================================================
+
+    def _get_zt_stock_list_eastmoney(self) -> pd.DataFrame:
+        """
+        通过东方财富涨停板专用接口获取涨停股列表
+        API: push2ex.eastmoney.com/getTopicZTPool (不同于 push2, 可能不被海外风控)
+        单次请求返回全部涨停股, 无需分页
+
+        Returns: DataFrame[代码, 名称, 涨跌幅, 连板数]
+        """
+        # 获取最近交易日
+        today = datetime.now()
+        # 周末回溯到周五
+        if today.weekday() == 5:  # 周六
+            trade_date = today - timedelta(days=1)
+        elif today.weekday() == 6:  # 周日
+            trade_date = today - timedelta(days=2)
+        else:
+            trade_date = today
+        date_str = trade_date.strftime("%Y%m%d")
+
+        url = "https://push2ex.eastmoney.com/getTopicZTPool"
+        params = {
+            "ut": "7eea3edcaed734bea9cbfc24409ed989",
+            "dpt": "wz.ztzt",
+            "Pageindex": "0",
+            "pagesize": "500",
+            "sort": "fbt:asc",
+            "date": date_str,
+        }
+        try:
+            resp = requests.get(
+                url, params=params,
+                timeout=self.EASTMONEY_TIMEOUT,
+                headers={"User-Agent": random.choice(_USER_AGENTS)},
+                proxies={"http": None, "https": None},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            if not data.get("data") or not data["data"].get("pool"):
+                logger.info("东财涨停板: {} 无涨停股", date_str)
+                return pd.DataFrame()
+
+            pool = data["data"]["pool"]
+            rows = []
+            for item in pool:
+                code = str(item.get("c", "")).strip()
+                name = item.get("n", "")
+                zdp = item.get("zdp", 0)
+                lbc = item.get("lbc", 0)
+
+                if not code or not name:
+                    continue
+                # 过滤科创板/北交所/ST
+                if self._is_excluded_code(code):
+                    continue
+                if re.search(r"ST|退|B股", str(name)):
+                    continue
+
+                rows.append({
+                    "代码": code,
+                    "名称": name,
+                    "涨跌幅": float(zdp) if zdp else 0,
+                    "连板数": int(lbc) if lbc else 0,
+                })
+
+            if not rows:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(rows)
+            logger.info(
+                "东财涨停板获取成功 | {} 涨停股: {} 只 (连板最高 {} 板)",
+                date_str, len(df), df["连板数"].max(),
+            )
+            self._mark_source_success("eastmoney")
+            return df
+
+        except Exception as e:
+            logger.warning("东财涨停板 API 失败: {}", e)
+            self._mark_source_fail("eastmoney")
+            return pd.DataFrame()
+
+    def _get_zt_stock_list_baostock(self, min_zt_pct: float = 9.8) -> pd.DataFrame:
+        """
+        通过 Baostock 获取涨停股 (兜底方案)
+        多线程查询全市场涨跌幅, 筛选 >= min_zt_pct 的股票
+        50 线程并发, 预估 5-8 分钟 (vs 旧版 10 线程 28 分钟)
+        """
+        df_list = self._get_a_share_stock_list_baostock()
+        if df_list.empty:
+            return pd.DataFrame()
+
+        # 过滤科创板/北交所
+        df_list = df_list[~df_list["代码"].apply(self._is_excluded_code)].reset_index(drop=True)
+        logger.info("Baostock 涨停筛选: {} 只待查询 (50 线程)", len(df_list))
+
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+
+        def _query_pct(code_name):
+            code, name = code_name
+            bs = _get_thread_bs_session()
+            if bs is None:
+                return (code, name, None)
+            try:
+                bs_code = self._baostock_code(code)
+                rs = bs.query_history_k_data_plus(
+                    code=bs_code,
+                    fields="date,pctChg",
+                    start_date=start_date,
+                    end_date=end_date,
+                    frequency="d",
+                )
+                if rs.error_code != "0" and rs.error_code != 0:
+                    return (code, name, None)
+                last_pct = None
+                while rs.next():
+                    row = rs.get_row_data()
+                    try:
+                        last_pct = float(row[1])
+                    except (ValueError, TypeError):
+                        pass
+                return (code, name, last_pct)
+            except Exception:
+                return (code, name, None)
+
+        zt_rows = []
+        total = len(df_list)
+        completed = 0
+
+        with ThreadPoolExecutor(max_workers=50) as executor:
+            futures = {
+                executor.submit(_query_pct, (row["代码"], row["名称"])): idx
+                for idx, row in df_list.iterrows()
+            }
+            for future in as_completed(futures):
+                completed += 1
+                code, name, pct = future.result()
+                if pct is not None and pct >= min_zt_pct:
+                    zt_rows.append({"代码": code, "名称": name, "涨跌幅": pct, "连板数": 0})
+                if completed % 1000 == 0:
+                    logger.info(
+                        "Baostock 涨停查询进度: {}/{} ({:.0f}%) | 涨停: {} 只",
+                        completed, total, completed / total * 100, len(zt_rows),
+                    )
+
+        if not zt_rows:
+            logger.info("Baostock 涨停筛选: 无涨停股 (>= {}%)", min_zt_pct)
+            return pd.DataFrame()
+
+        df = pd.DataFrame(zt_rows)
+        df = df.sort_values("涨跌幅", ascending=False).reset_index(drop=True)
+        logger.info(
+            "Baostock 涨停筛选完成 | 涨停 {} 只 (共查询 {} 只)",
+            len(df), total,
+        )
+        self._mark_source_success("baostock")
+        return df
+
+    def get_zt_stock_list(self) -> list:
+        """
+        获取涨停股列表 (只扫描涨停股)
+        故障切换: 东财涨停板API (1次请求, 秒级) → Baostock (50线程, 5-8分钟)
+
+        Returns: [("a_share", code, name), ...]
+        """
+        # 首选: 东财涨停板专用API (push2ex, 不同于push2, 可能不被海外风控)
+        if self._is_source_available("eastmoney"):
+            df = self._get_zt_stock_list_eastmoney()
+            if not df.empty:
+                return [("a_share", row["代码"], row["名称"]) for _, row in df.iterrows()]
+
+        # 兜底: Baostock 多线程查询 (50 workers)
+        if self._is_source_available("baostock"):
+            df = self._get_zt_stock_list_baostock()
+            if not df.empty:
+                return [("a_share", row["代码"], row["名称"]) for _, row in df.iterrows()]
+
+        logger.error("获取涨停股列表失败 (所有数据源均不可用)")
+        return []
+
     def get_hot_stock_list(self, min_change_pct: float = 5.0) -> list:
         """
         获取涨幅 > min_change_pct 的热门股票列表
@@ -1477,17 +1661,28 @@ class DataETL:
     # 统一数据接口
     # ============================================================
 
-    def get_stock_list(self, min_change_pct: float = 0.0) -> list:
+    def get_stock_list(self, min_change_pct: float = 0.0, zt_only: bool = False) -> list:
         """
         获取股票列表 (根据市场自动路由)
 
         Args:
             min_change_pct: 最小涨幅过滤 (0=不过滤, >0=只取涨幅超过此值的股票)
                            涨幅过滤可大幅减少扫描数量 (5000+ → 几十~两百家)
+            zt_only: 只扫描涨停股 (数量最少 ~20-100 只, 扫描最快)
+                    优先级高于 min_change_pct
 
         安全处理: 数据源失败时返回空列表, 不抛出 KeyError
         """
         if self.market in ("a_share", "all"):
+            # 涨停股模式: 只扫描涨停股 (数量最少, 扫描最快)
+            if zt_only:
+                zt_list = self.get_zt_stock_list()
+                if self.market == "a_share":
+                    return zt_list
+                else:
+                    us_codes = self.get_us_stock_list()
+                    return zt_list + [("us_stock", code, code) for code in us_codes]
+
             # 涨幅过滤模式: 只扫描涨幅 > min_change_pct 的股票
             if min_change_pct > 0:
                 hot_list = self.get_hot_stock_list(min_change_pct)
