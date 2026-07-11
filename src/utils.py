@@ -298,6 +298,7 @@ def health_check(market: str = "a_share") -> dict:
             "akshare": {"available": bool, "latency_ms": int, "error": str},
             "yfinance": {"available": bool, "latency_ms": int, "error": str},
             "efinance": {"available": bool, "latency_ms": int, "error": str},
+            "eastmoney": {"available": bool, "latency_ms": int, "error": str},
         }
     """
     results = {}
@@ -355,6 +356,32 @@ def health_check(market: str = "a_share") -> dict:
     except Exception as e:
         results["efinance"] = {"available": False, "latency_ms": 0, "error": str(e)}
         logger.warning("efinance 健康检查 FAIL | {}", e)
+
+    # 东财 HTTP (兜底数据源, 纯 requests, GitHub Actions 友好)
+    try:
+        start = time.time()
+        url = "http://push2.eastmoney.com/api/qt/clist/get"
+        params = {
+            "pn": 1, "pz": 10, "po": 1, "np": 1,
+            "fltt": 2, "invt": 2, "fid": "f12",
+            "fs": "m:1+t:2", "fields": "f12,f14",
+        }
+        resp = requests.get(url, params=params, timeout=15, headers={"User-Agent": random.choice(_USER_AGENTS)})
+        resp.raise_for_status()
+        data = resp.json()
+        diff = data.get("data", {}).get("diff", {})
+        latency = int((time.time() - start) * 1000)
+        has_data = bool(diff)
+        results["eastmoney"] = {
+            "available": has_data,
+            "latency_ms": latency,
+            "rows": len(diff) if diff else 0,
+            "error": "",
+        }
+        logger.info("东财HTTP 健康检查 PASS | {}ms | {} 行", latency, len(diff) if diff else 0)
+    except Exception as e:
+        results["eastmoney"] = {"available": False, "latency_ms": 0, "error": str(e)}
+        logger.warning("东财HTTP 健康检查 FAIL | {}", e)
 
     return results
 

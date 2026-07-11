@@ -1,14 +1,13 @@
 """
-Data ETL 模块 - 数据抓取与清洗 (v2.0 自愈版)
+Data ETL 模块 - 数据抓取与清洗 (v3.0 东财HTTP版)
 ================================================
-负责从 AkShare (A股) / yfinance (美股) 获取实时和历史K线数据，
+负责从 AkShare (A股) / yfinance (美股) / 东财HTTP (A股兜底) 获取实时和历史K线数据，
 进行清洗、标准化、缓存，为下游扫描引擎提供统一格式数据。
 
-v2.0 新增 -- 数据源故障切换 (Failover):
-  - A股主源 AkShare 失败 → 自动切换 efinance 备用源
-  - 美股主源 yfinance 失败 → 自动切换 AkShare 美股接口
-  - 每次请求带超时检测, 超时自动切换
-  - 健康检查预热, 提前剔除不可用源
+v3.0 重大变更 -- 东财 HTTP 接口作为 A 股第三数据源:
+  - AkShare 失败 → 自动切换 efinance 备用源
+  - efinance 失败 → 自动切换东财 HTTP 纯接口 (GitHub Actions 海外环境最稳定)
+  - 美股仍使用 yfinance (海外环境原生支持)
 
 依赖开源库:
   - AkShare:   https://github.com/akfamily/akshare   (21.2k stars)
@@ -21,6 +20,8 @@ v2.0 新增 -- 数据源故障切换 (Failover):
     ak.stock_zh_a_hist(symbol, period, start_date, end_date, adjust)
   efinance A股日线 (备用):
     ef.stock.get_quote_history(stock_codes, klt=101, fqt=1)
+  东财 HTTP A股日线 (兜底, 纯 requests, 无需额外库):
+    push2his.eastmoney.com/api/qt/stock/kline/get
   yfinance 美股日线:
     yf.download(tickers, start, end, interval)
 """
@@ -50,7 +51,7 @@ _USER_AGENTS = [
 ]
 
 # Monkey-patch requests.Session.request, 为所有 HTTP 请求注入浏览器 User-Agent
-# AkShare / efinance 内部使用 requests, 此补丁确保所有请求都带上正常浏览器 UA
+# AkShare / efinance / 东财HTTP 都使用 requests, 此补丁确保所有请求都带上正常浏览器 UA
 if not getattr(requests.Session.request, '_patched_with_ua', False):
     _original_session_request = requests.Session.request
 
@@ -67,15 +68,19 @@ if not getattr(requests.Session.request, '_patched_with_ua', False):
 
 
 class DataETL:
-    """数据抓取与清洗引擎 (v2.0 自愈版)"""
+    """数据抓取与清洗引擎 (v3.0 东财HTTP版)"""
 
     # 数据源健康状态
     SOURCE_AKSHARE = True
     SOURCE_EFINANCE = True
     SOURCE_YFINANCE = True
+    SOURCE_EASTMONEY = True
 
     # 请求超时 (秒) -- 超过此时间判定为数据源不可用
     REQUEST_TIMEOUT = 30
+
+    # 东财 HTTP 接口超时
+    EASTMONEY_TIMEOUT = 15
 
     def __init__(self, market: str = "a_share"):
         self.market = market
@@ -83,7 +88,7 @@ class DataETL:
         self._yf = None
         self._ef = None
         # 数据源故障计数器 (连续失败 N 次后暂时跳过)
-        self._fail_counts = {"akshare": 0, "efinance": 0, "yfinance": 0}
+        self._fail_counts = {"akshare": 0, "efinance": 0, "yfinance": 0, "eastmoney": 0}
         self._FAIL_THRESHOLD = 3
 
     @property
@@ -137,10 +142,9 @@ class DataETL:
             self._fail_counts[source] = 0
 
     # ============================================================
-    # A股数据
+    # 重试配置
     # ============================================================
 
-    # 重试配置
     MAX_RETRIES = 3
     RETRY_DELAY_MIN = 2.0   # 重试间隔最小秒数
     RETRY_DELAY_MAX = 5.0   # 重试间隔最大秒数
@@ -149,14 +153,216 @@ class DataETL:
         """随机延迟, 避免被数据源限流"""
         return random.uniform(self.RETRY_DELAY_MIN, self.RETRY_DELAY_MAX)
 
+    # ============================================================
+    # 东财 HTTP 接口 (纯 requests, 无需额外库, GitHub Actions 友好)
+    # ============================================================
+
+    @staticmethod
+    def _secid(code: str) -> str:
+        """根据股票代码判断东财 secid (1=上海, 0=深圳)"""
+        # 上海: 600xxx, 601xxx, 603xxx, 605xxx, 688xxx(科创板)
+        # 深圳: 000xxx, 002xxx, 003xxx, 300xxx(创业板), 301xxx(创业板)
+        if code.startswith("6"):
+            return f"1.{code}"
+        return f"0.{code}"
+
+    def _get_a_share_stock_list_eastmoney(self) -> pd.DataFrame:
+        """
+        通过东方财富 HTTP 接口获取 A 股全市场股票列表
+        返回: DataFrame[代码, 名称, 最新价, 涨跌幅]
+        """
+        url = "http://push2.eastmoney.com/api/qt/clist/get"
+        params = {
+            "pn": 1,
+            "pz": 5000,          # 每页 5000 条, 足够覆盖全市场
+            "po": 1,
+            "np": 1,
+            "fltt": 2,
+            "invt": 2,
+            "fid": "f12",
+            "fs": "m:0+t:6,m:0+t:13,m:0+t:80,m:1+t:2,m:1+t:23",  # 沪深A股
+            "fields": "f12,f14,f2,f3",  # 代码, 名称, 最新价, 涨跌幅
+        }
+        try:
+            resp = requests.get(
+                url, params=params,
+                timeout=self.EASTMONEY_TIMEOUT,
+                headers={"User-Agent": random.choice(_USER_AGENTS)},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            diff = data.get("data", {}).get("diff")
+            if not diff:
+                logger.warning("东财 HTTP 返回 diff 为空")
+                return pd.DataFrame()
+
+            rows = []
+            for item in diff.values():
+                code = str(item.get("f12", "")).strip()
+                name = item.get("f14", "")
+                if not code or not name:
+                    continue
+                rows.append({
+                    "代码": code,
+                    "名称": name,
+                    "最新价": item.get("f2", 0),
+                    "涨跌幅": item.get("f3", 0),
+                })
+
+            if not rows:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(rows)
+            # 过滤 ST 和退市股
+            df = df[~df["名称"].str.contains(r"ST|退|B股", na=False)]
+            logger.info(
+                "A股股票列表获取成功 (东财HTTP) | 共 {} 只股票",
+                len(df),
+            )
+            self._mark_source_success("eastmoney")
+            return df
+
+        except Exception as e:
+            logger.warning("东财 HTTP 获取股票列表失败: {}", e)
+            self._mark_source_fail("eastmoney")
+            return pd.DataFrame()
+
+    def _get_a_share_kline_eastmoney(
+        self, symbol: str, days: int, adjust: str
+    ) -> pd.DataFrame:
+        """通过东方财富 HTTP 接口获取 A 股 K 线数据"""
+        secid = self._secid(symbol)
+        end_date = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=days * 2)).strftime("%Y%m%d")
+        fqt_map = {"qfq": 1, "hfq": 2, "": 0}
+        fqt = fqt_map.get(adjust, 1)
+
+        url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
+        params = {
+            "secid": secid,
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57",
+            "klt": 101,          # 日线
+            "fqt": fqt,
+            "beg": start_date,
+            "end": end_date,
+            "lmt": 500,          # 最多返回 500 条
+        }
+        try:
+            resp = requests.get(
+                url, params=params,
+                timeout=self.EASTMONEY_TIMEOUT,
+                headers={"User-Agent": random.choice(_USER_AGENTS)},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            klines = data.get("data", {}).get("klines", [])
+            if not klines:
+                logger.debug("东财 HTTP {} K线返回空", symbol)
+                return pd.DataFrame()
+
+            rows = []
+            for kline in klines:
+                parts = kline.split(",")
+                if len(parts) < 6:
+                    continue
+                rows.append({
+                    "date": parts[0],
+                    "open": float(parts[1]),
+                    "close": float(parts[2]),
+                    "low": float(parts[4]),
+                    "high": float(parts[3]),
+                    "volume": float(parts[5]),
+                    "amount": float(parts[6]) if len(parts) > 6 else 0,
+                })
+
+            df = pd.DataFrame(rows)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date").reset_index(drop=True)
+            df = df.tail(days).reset_index(drop=True)
+            logger.debug("东财 HTTP 获取 {} K线成功 | {} 条", symbol, len(df))
+            self._mark_source_success("eastmoney")
+            return df
+
+        except Exception as e:
+            logger.debug("东财 HTTP 获取 {} K线失败: {}", symbol, e)
+            self._mark_source_fail("eastmoney")
+            return pd.DataFrame()
+
+    def _get_a_share_index_eastmoney(self, days: int) -> pd.DataFrame:
+        """通过东方财富 HTTP 接口获取沪深300指数"""
+        end_date = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=days * 2)).strftime("%Y%m%d")
+
+        url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
+        params = {
+            "secid": "1.000300",   # 沪深300
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57",
+            "klt": 101,
+            "fqt": 0,
+            "beg": start_date,
+            "end": end_date,
+            "lmt": 500,
+        }
+        try:
+            resp = requests.get(
+                url, params=params,
+                timeout=self.EASTMONEY_TIMEOUT,
+                headers={"User-Agent": random.choice(_USER_AGENTS)},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            klines = data.get("data", {}).get("klines", [])
+            if not klines:
+                logger.warning("东财 HTTP 沪深300指数返回空")
+                return pd.DataFrame()
+
+            rows = []
+            for kline in klines:
+                parts = kline.split(",")
+                if len(parts) < 6:
+                    continue
+                rows.append({
+                    "date": parts[0],
+                    "open": float(parts[1]),
+                    "close": float(parts[2]),
+                    "low": float(parts[4]),
+                    "high": float(parts[3]),
+                    "volume": float(parts[5]),
+                })
+
+            df = pd.DataFrame(rows)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date").reset_index(drop=True)
+            df = df.tail(days).reset_index(drop=True)
+            logger.info(
+                "沪深300指数数据获取成功 (东财HTTP) | {} 日",
+                len(df),
+            )
+            self._mark_source_success("eastmoney")
+            return df
+
+        except Exception as e:
+            logger.warning("东财 HTTP 获取沪深300指数失败: {}", e)
+            self._mark_source_fail("eastmoney")
+            return pd.DataFrame()
+
+    # ============================================================
+    # A股数据
+    # ============================================================
+
     def get_a_share_stock_list(self) -> pd.DataFrame:
         """
-        获取A股全市场股票列表 (东财接口)
+        获取A股全市场股票列表
         返回: DataFrame[代码, 名称, 最新价, 涨跌幅, ...]
 
-        故障切换: AkShare → efinance
+        故障切换: AkShare → efinance → 东财HTTP
         每个数据源最多重试 MAX_RETRIES 次, 重试间隔随机延迟 2-5 秒
-        所有数据源彻底失败时返回空 DataFrame (不含任何列)
+        所有数据源彻底失败时返回空 DataFrame
         """
         # 主源: AkShare (带重试)
         if self._is_source_available("akshare"):
@@ -183,14 +389,13 @@ class DataETL:
                         attempt + 1, self.MAX_RETRIES, e,
                     )
 
-                # 未达最大重试次数, 等待后重试
                 if attempt < self.MAX_RETRIES - 1:
                     delay = self._retry_delay()
                     logger.info("等待 {:.1f}s 后重试 AkShare...", delay)
                     time.sleep(delay)
 
             logger.warning(
-                "AkShare 连续 {} 次重试均失败, 切换备用源 efinance",
+                "AkShare 连续 {} 次重试均失败, 切换备用源",
                 self.MAX_RETRIES,
             )
             self._mark_source_fail("akshare")
@@ -201,14 +406,12 @@ class DataETL:
                 try:
                     df = self.ef.stock.get_realtime_quotes()
                     if df is not None and not df.empty:
-                        # efinance 列名映射
                         col_map = {}
                         if "股票代码" in df.columns:
                             col_map["股票代码"] = "代码"
                         if "股票名称" in df.columns:
                             col_map["股票名称"] = "名称"
                         df = df.rename(columns=col_map)
-                        # 过滤 ST 和退市股
                         if "名称" in df.columns:
                             df = df[~df["名称"].str.contains(r"ST|退|B股", na=False)]
                         logger.info(
@@ -228,16 +431,23 @@ class DataETL:
                         attempt + 1, self.MAX_RETRIES, e,
                     )
 
-                # 未达最大重试次数, 等待后重试
                 if attempt < self.MAX_RETRIES - 1:
                     delay = self._retry_delay()
                     logger.info("等待 {:.1f}s 后重试 efinance...", delay)
                     time.sleep(delay)
 
             logger.error(
-                "efinance 连续 {} 次重试均失败", self.MAX_RETRIES,
+                "efinance 连续 {} 次重试均失败, 切换东财HTTP",
+                self.MAX_RETRIES,
             )
             self._mark_source_fail("efinance")
+
+        # 兜底源: 东财 HTTP (纯 requests, GitHub Actions 最稳定)
+        if self._is_source_available("eastmoney"):
+            logger.info("尝试东财 HTTP 接口获取股票列表...")
+            df = self._get_a_share_stock_list_eastmoney()
+            if not df.empty:
+                return df
 
         logger.error("所有数据源获取A股股票列表均失败 (已重试 {} 次/源)", self.MAX_RETRIES)
         return pd.DataFrame()
@@ -251,7 +461,7 @@ class DataETL:
         """
         获取A股个股历史K线数据 (前复权)
 
-        故障切换: AkShare → efinance
+        故障切换: AkShare → efinance → 东财HTTP
 
         Args:
             symbol: 股票代码, 如 "000001"
@@ -270,7 +480,6 @@ class DataETL:
             if not df.empty:
                 self._mark_source_success("akshare")
                 return df
-            # 空数据不标记失败 (可能是新股上市不足)
             if df is not None and df.empty:
                 return pd.DataFrame()
 
@@ -279,6 +488,12 @@ class DataETL:
             df = self._fetch_a_share_kline_efinance(symbol, days, adjust)
             if not df.empty:
                 self._mark_source_success("efinance")
+                return df
+
+        # 兜底源: 东财 HTTP
+        if self._is_source_available("eastmoney"):
+            df = self._get_a_share_kline_eastmoney(symbol, days, adjust)
+            if not df.empty:
                 return df
 
         return pd.DataFrame()
@@ -298,7 +513,6 @@ class DataETL:
             if df.empty:
                 return pd.DataFrame()
 
-            # 标准化列名
             df = df.rename(columns={
                 "日期": "date",
                 "开盘": "open",
@@ -325,7 +539,6 @@ class DataETL:
     ) -> pd.DataFrame:
         """通过 efinance 获取A股K线 (备用源)"""
         try:
-            # efinance 参数: klt=101(日线), fqt=1(前复权)/2(后复权)/0(不复权)
             fqt_map = {"qfq": 1, "hfq": 2, "": 0}
             fqt = fqt_map.get(adjust, 1)
 
@@ -337,7 +550,6 @@ class DataETL:
             if df is None or df.empty:
                 return pd.DataFrame()
 
-            # efinance 列名映射
             col_map = {
                 "日期": "date",
                 "开盘": "open",
@@ -371,7 +583,6 @@ class DataETL:
         获取美股热门股票列表
         默认使用内置的大盘股+热门股列表
         """
-        # 热门美股代码列表
         us_stocks = [
             "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA",
             "AMD", "NFLX", "JPM", "V", "MA", "DIS", "BABA", "INTC",
@@ -433,7 +644,6 @@ class DataETL:
             if df.empty:
                 return pd.DataFrame()
 
-            # 标准化列名
             df = df.reset_index()
             df = df.rename(columns={
                 "Date": "date",
@@ -444,7 +654,6 @@ class DataETL:
                 "Volume": "volume",
             })
 
-            # 处理多级列名 (yfinance 有时返回 MultiIndex)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
@@ -463,7 +672,6 @@ class DataETL:
     def _fetch_us_kline_akshare(self, symbol: str, days: int) -> pd.DataFrame:
         """通过 AkShare 美股接口获取K线 (备用源)"""
         try:
-            # AkShare 美股历史数据接口
             df = self.ak.stock_us_hist(
                 symbol=symbol,
                 period="daily",
@@ -472,7 +680,6 @@ class DataETL:
             if df is None or df.empty:
                 return pd.DataFrame()
 
-            # 标准化列名 (AkShare 美股返回中文列名)
             df = df.rename(columns={
                 "日期": "date",
                 "开盘": "open",
@@ -503,7 +710,7 @@ class DataETL:
         """
         获取沪深300指数历史K线数据 (用于 Beta Filter)
 
-        故障切换: AkShare index_daily → efinance 指数接口
+        故障切换: AkShare → efinance → 东财HTTP
         每个数据源最多重试 MAX_RETRIES 次
 
         Returns:
@@ -579,8 +786,15 @@ class DataETL:
                     logger.info("等待 {:.1f}s 后重试 efinance 指数...", delay)
                     time.sleep(delay)
 
-            logger.error("efinance 指数连续 {} 次失败", self.MAX_RETRIES)
+            logger.error("efinance 指数连续 {} 次失败, 切换东财HTTP", self.MAX_RETRIES)
             self._mark_source_fail("efinance")
+
+        # 兜底源: 东财 HTTP
+        if self._is_source_available("eastmoney"):
+            logger.info("尝试东财 HTTP 接口获取沪深300指数...")
+            df = self._get_a_share_index_eastmoney(days)
+            if not df.empty:
+                return df
 
         logger.error("所有数据源获取沪深300指数均失败")
         return pd.DataFrame()
@@ -656,12 +870,10 @@ class DataETL:
             df = self.get_a_share_stock_list()
 
             # 安全检查: 数据源彻底失败时 df 为空 DataFrame (无列)
-            # 此时绝不能访问 df["代码"], 否则触发 KeyError
             if df is None or df.empty or "代码" not in df.columns:
                 logger.error("A股股票列表获取失败 (数据源不可用), 返回空列表")
                 if self.market == "a_share":
                     return []
-                # all 模式下仍可返回美股内置列表
                 us_codes = self.get_us_stock_list()
                 return [("us_stock", code, code) for code in us_codes]
 
@@ -671,7 +883,6 @@ class DataETL:
                     for code, name in zip(df["代码"], df["名称"])
                 ]
 
-            # all 模式: A股 + 美股
             us_codes = self.get_us_stock_list()
             return (
                 [("a_share", code, name) for code, name in zip(df["代码"], df["名称"])]
