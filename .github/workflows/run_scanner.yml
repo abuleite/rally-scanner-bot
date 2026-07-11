@@ -1,0 +1,201 @@
+# ============================================================
+# 主升浪加速行情自动扫描 - GitHub Actions 定时任务 v2.0
+# ============================================================
+# 方案 A: 零成本免维护部署
+#
+# 特性:
+#   - 每个交易日盘后 16:00 (北京时间) 自动运行
+#   - 非交易日自动跳过 (节省 Actions 额度)
+#   - 数据源故障自动切换 (AkShare → efinance)
+#   - 运行后自动清理临时文件 (防止 artifact 膨胀)
+#   - 失败自动重试 1 次
+#   - 日志和死信队列自动上传 (保留 7 天)
+#
+# 免费额度: 每月 2000 分钟, 每次运行约 3-5 分钟, 月消耗约 150 分钟
+#
+# 使用前需要:
+# 1. Fork 或推送到你的 GitHub 仓库
+# 2. 在仓库 Settings → Secrets and variables → Actions 中添加 Secrets
+# 3. 所有 Secrets 会自动注入为环境变量
+#
+# 需要的 Secrets (至少配置一个通知渠道):
+#   通知类:
+#   - TELEGRAM_BOT_TOKEN     (Telegram Bot Token)
+#   - TELEGRAM_CHAT_ID       (Telegram Chat ID)
+#   - DINGTALK_WEBHOOK       (钉钉机器人 Webhook URL)
+#   - DINGTALK_SECRET        (钉钉加签密钥, 可选)
+#   - WECOM_WEBHOOK          (企业微信群机器人 Webhook URL)
+#   - DISCORD_WEBHOOK        (Discord Webhook URL)
+#   - SC_KEY                 (Server酱 Key)
+#   - PUSHPLUS_TOKEN         (PushPlus Token)
+# ============================================================
+
+name: 主升浪加速行情扫描
+
+on:
+  # 定时任务: 每个交易日盘后 16:00 (北京时间)
+  # UTC 08:00 = 北京时间 16:00
+  # GitHub Actions cron 使用 UTC 时间
+  schedule:
+    - cron: '0 8 * * 1-5'
+
+  # 手动触发 (支持自定义参数)
+  workflow_dispatch:
+    inputs:
+      market:
+        description: '扫描市场 (a_share/us_stock/all)'
+        required: false
+        default: 'a_share'
+        type: choice
+        options:
+          - a_share
+          - us_stock
+          - all
+      run_mode:
+        description: '运行模式 (dry_run=仅输出/notify=推送通知)'
+        required: false
+        default: 'notify'
+        type: choice
+        options:
+          - dry_run
+          - notify
+      force:
+        description: '强制运行 (忽略交易日判断)'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      MARKET: ${{ github.event.inputs.market || 'a_share' }}
+      SCAN_SCOPE: all
+      RUN_MODE: ${{ github.event.inputs.run_mode || 'notify' }}
+      SC_KEY: ${{ secrets.SC_KEY }}
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+      DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      WEBHOOK_MAX_RETRIES: '3'
+      WEBHOOK_RETRY_DELAY: '1.0'
+      VOLUME_SURGE_RATIO: '2.0'
+      VCP_CONTRACTION_THRESHOLD: '1.3'
+      BOLLINGER_EXPLODE_RATIO: '1.5'
+      CANDLE_BODY_MIN_PCT: '3.0'
+      RSI_LOWER: '50'
+      RSI_UPPER: '85'
+
+    steps:
+      # Step 1: 检出代码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Step 2: 安装 Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      # Step 3: 安装依赖
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Step 4: 交易日判断 (非交易日直接跳过, 节省 Actions 额度)
+      - name: Check trading day
+        id: trading_day
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'src')
+          from utils import TradingCalendar
+          import os
+          market = os.environ.get('MARKET', 'a_share')
+          force = '${{ github.event.inputs.force }}' == 'true'
+          if force:
+              print('FORCE_RUN=true')
+              print('Trading day check bypassed (force=true)')
+          elif TradingCalendar.should_run(market):
+              print('FORCE_RUN=false')
+              print(f'Today is a trading day for {market}')
+          else:
+              print('SKIP=true')
+              print(f'Today is NOT a trading day for {market}, skipping...')
+              # Exit with special code to skip remaining steps
+              import sys
+              sys.exit(78)  # 78 = neutral exit (skipped)
+          " || {
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 78 ]; then
+              echo "skip=true" >> $GITHUB_OUTPUT
+              echo "Today is not a trading day, skipping scan."
+              exit 0
+            else
+              exit $EXIT_CODE
+            fi
+          }
+
+      # Step 5: 执行主升浪扫描流水线 (带故障切换)
+      - name: Run Rally Scanner Pipeline
+        if: steps.trading_day.outputs.skip != 'true'
+        run: |
+          FORCE_FLAG=""
+          if [ '${{ github.event.inputs.force }}' = 'true' ]; then
+            FORCE_FLAG="--force"
+          fi
+          cd src
+          python main.py $FORCE_FLAG
+
+      # Step 6: 自动清理临时文件 (防止 artifact 膨胀)
+      - name: Cleanup temp files
+        if: always()
+        run: |
+          echo "Cleaning up temporary files..."
+          find . -maxdepth 3 \( -name "*.csv" -o -name "*.tmp" -o -name "*.pkl" -o -name "*.parquet" \) -mtime +1 -delete 2>/dev/null || true
+          echo "Cleanup complete."
+
+      # Step 7: 上传扫描日志和死信队列 (保留 7 天)
+      - name: Upload scan logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-logs-${{ github.run_id }}
+          path: |
+            logs/
+            *.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # Step 8: 汇总通知 (扫描失败时发送告警)
+      - name: Notify on failure
+        if: failure() && steps.trading_day.outputs.skip != 'true'
+        run: |
+          python -c "
+          import os, sys, requests
+          sys.path.insert(0, 'src')
+          from notifier import Notifier
+          notifier = Notifier()
+          alert = f'''**[扫描流水线故障]**
+          仓库: ${{ github.repository }}
+          运行: ${{ github.run_id }}
+          分支: ${{ github.ref_name }}
+          请检查 Actions 日志排查问题.'''
+          if notifier.tg_token and notifier.tg_chat_id:
+              notifier._send_telegram(alert)
+          if notifier.dingtalk_webhook:
+              notifier._send_dingtalk('扫描流水线故障', alert)
+          if notifier.wecom_webhook:
+              notifier._send_wecom(alert)
+          if notifier.discord_webhook:
+              notifier._send_discord([{'title': '⚠️ 扫描流水线故障', 'color': 0xFF0000, 'description': alert}])
+          print('Failure alert sent.')
+          " || true
