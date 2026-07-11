@@ -366,7 +366,7 @@ def health_check(market: str = "a_share") -> dict:
             "fltt": 2, "invt": 2, "fid": "f12",
             "fs": "m:1+t:2", "fields": "f12,f14",
         }
-        resp = requests.get(url, params=params, timeout=15, headers={"User-Agent": random.choice(_USER_AGENTS)})
+        resp = requests.get(url, params=params, timeout=15, headers={"User-Agent": random.choice(_USER_AGENTS)}, proxies={"http": None, "https": None})
         resp.raise_for_status()
         data = resp.json()
         diff = data.get("data", {}).get("diff", {})

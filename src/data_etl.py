@@ -193,6 +193,7 @@ class DataETL:
                         url, params=params,
                         timeout=self.EASTMONEY_TIMEOUT,
                         headers={"User-Agent": random.choice(_USER_AGENTS)},
+                        proxies={"http": None, "https": None},
                     )
                     resp.raise_for_status()
                     data = resp.json()
@@ -273,6 +274,7 @@ class DataETL:
                 url, params=params,
                 timeout=self.EASTMONEY_TIMEOUT,
                 headers={"User-Agent": random.choice(_USER_AGENTS)},
+                proxies={"http": None, "https": None},
             )
             resp.raise_for_status()
             data = resp.json()
@@ -331,6 +333,7 @@ class DataETL:
                 url, params=params,
                 timeout=self.EASTMONEY_TIMEOUT,
                 headers={"User-Agent": random.choice(_USER_AGENTS)},
+                proxies={"http": None, "https": None},
             )
             resp.raise_for_status()
             data = resp.json()
@@ -394,6 +397,7 @@ class DataETL:
                 url, params=params,
                 timeout=self.EASTMONEY_TIMEOUT,
                 headers={"User-Agent": random.choice(_USER_AGENTS)},
+                proxies={"http": None, "https": None},
             )
             resp.raise_for_status()
             data = resp.json()
@@ -454,6 +458,7 @@ class DataETL:
                 url, params=params,
                 timeout=self.EASTMONEY_TIMEOUT,
                 headers={"User-Agent": random.choice(_USER_AGENTS)},
+                proxies={"http": None, "https": None},
             )
             resp.raise_for_status()
             import json as _json
