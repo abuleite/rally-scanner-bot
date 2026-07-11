@@ -6,12 +6,14 @@
 # 特性:
 #   - 每个交易日盘后 16:00 (北京时间) 自动运行
 #   - 非交易日自动跳过 (节省 Actions 额度)
-#   - 数据源故障自动切换 (Baostock → AkShare → efinance → 东财/腾讯/新浪HTTP)
+#   - 数据源故障自动切换 (Baostock TCP → AkShare → efinance → 东财/腾讯/新浪HTTP)
+#   - 涨幅过滤: 只扫描涨幅 > 5% 的股票 (5000+ → 几十~两百家, 大幅提速)
+#   - 多线程并发抓取K线 (10 线程, Baostock 每个 worker 独立 TCP 连接)
 #   - 运行后自动清理临时文件 (防止 artifact 膨胀)
 #   - 失败自动重试 1 次
 #   - 日志和死信队列自动上传 (保留 7 天)
 #
-# 免费额度: 每月 2000 分钟, 每次运行约 3-5 分钟, 月消耗约 150 分钟
+# 免费额度: 每月 2000 分钟, 每次运行约 2-5 分钟, 月消耗约 100 分钟
 #
 # 使用前需要:
 # 1. Fork 或推送到你的 GitHub 仓库
@@ -68,7 +70,7 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
 
     env:
       MARKET: ${{ github.event.inputs.market || 'a_share' }}
@@ -88,6 +90,7 @@ jobs:
       VCP_CONTRACTION_THRESHOLD: '1.3'
       BOLLINGER_EXPLODE_RATIO: '1.5'
       CANDLE_BODY_MIN_PCT: '3.0'
+      MIN_CHANGE_PCT: '5.0'
       RSI_LOWER: '50'
       RSI_UPPER: '85'
 

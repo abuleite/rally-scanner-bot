@@ -27,13 +27,16 @@ v3.0 重大变更 -- 东财 HTTP 接口作为 A 股第三数据源:
 """
 
 import time
+import re
 import random
+import threading
 import requests
 import pandas as pd
 import numpy as np
 from loguru import logger
 from datetime import datetime, timedelta
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # ============================================================
@@ -65,6 +68,27 @@ if not getattr(requests.Session.request, '_patched_with_ua', False):
     _patched_session_request._patched_with_ua = True
     requests.Session.request = _patched_session_request
     logger.debug("User-Agent 全局注入补丁已生效")
+
+
+# ============================================================
+# 线程本地 Baostock 会话 (多线程并发查询用, 每个 worker 独立 TCP 连接)
+# ============================================================
+_bs_local = threading.local()
+
+
+def _get_thread_bs_session():
+    """获取线程本地的 Baostock 会话 (每个线程独立 login, 线程安全)"""
+    if not getattr(_bs_local, "bs", None):
+        try:
+            import baostock as bs
+            lg = bs.login()
+            if lg.error_code == "0" or lg.error_code == 0:
+                _bs_local.bs = bs
+                return bs
+            return None
+        except Exception:
+            return None
+    return _bs_local.bs
 
 
 class DataETL:
@@ -194,6 +218,18 @@ class DataETL:
             except Exception:
                 pass
 
+    def _get_bs_session(self):
+        """
+        获取 Baostock 会话 (线程安全)
+        主线程使用 self._bs, worker 线程使用线程本地会话
+        """
+        if threading.current_thread() is threading.main_thread():
+            if self._baostock_login():
+                return self._bs
+            return None
+        else:
+            return _get_thread_bs_session()
+
     @staticmethod
     def _baostock_code(symbol: str) -> str:
         """将纯数字代码转换为 Baostock 格式 (sh.600519 / sz.000001)"""
@@ -203,6 +239,23 @@ class DataETL:
         if symbol.startswith("6"):
             return f"sh.{symbol}"
         return f"sz.{symbol}"
+
+    @staticmethod
+    def _is_excluded_code(code: str) -> bool:
+        """
+        判断股票代码是否应被排除:
+        - 688 开头: 科创板
+        - 8 开头: 北交所
+        - 4 开头: 老三板
+        """
+        code = str(code).strip()
+        if code.startswith("688"):
+            return True
+        if code.startswith("8"):
+            return True
+        if code.startswith("4"):
+            return True
+        return False
 
     def _get_a_share_stock_list_baostock(self) -> pd.DataFrame:
         """
@@ -251,8 +304,10 @@ class DataETL:
         """
         通过 Baostock 获取 A 股个股历史 K 线
         TCP socket 连接, 海外 IP 不被风控
+        线程安全: 主线程和 worker 线程各有独立会话
         """
-        if not self._baostock_login():
+        bs = self._get_bs_session()
+        if bs is None:
             return pd.DataFrame()
         try:
             bs_code = self._baostock_code(symbol)
@@ -263,7 +318,7 @@ class DataETL:
             end_date = datetime.now().strftime("%Y-%m-%d")
             start_date = (datetime.now() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
 
-            rs = self._bs.query_history_k_data_plus(
+            rs = bs.query_history_k_data_plus(
                 code=bs_code,
                 fields="date,code,open,high,low,close,volume,amount,turn,pctChg,preclose",
                 start_date=start_date,
@@ -689,7 +744,202 @@ class DataETL:
     # A股数据
     # ============================================================
 
-    def get_a_share_stock_list(self) -> pd.DataFrame:
+    def _get_a_share_hot_stocks_eastmoney(self, min_change_pct: float = 5.0) -> pd.DataFrame:
+        """
+        通过东方财富 HTTP 接口获取涨幅 > min_change_pct 的股票
+        利用东财接口排序功能 (fid=f3 按涨跌幅降序), 涨幅 < 阈值时提前终止分页
+        通常只需 1-3 页即可获取全部涨幅 > 5% 的股票
+
+        Returns: DataFrame[代码, 名称, 涨跌幅]
+        """
+        url = "http://push2.eastmoney.com/api/qt/clist/get"
+        base_params = {
+            "po": 1,           # 降序 (涨幅最高的在前)
+            "np": 1,
+            "fltt": 2,
+            "invt": 2,
+            "fid": "f3",       # 按涨跌幅排序
+            "fs": "m:0+t:6,m:0+t:13,m:0+t:80,m:1+t:2,m:1+t:23",
+            "fields": "f12,f14,f3",  # 代码, 名称, 涨跌幅
+        }
+        try:
+            all_rows = []
+            page = 1
+            while True:
+                try:
+                    params = {**base_params, "pn": page, "pz": 100}
+                    resp = requests.get(
+                        url, params=params,
+                        timeout=self.EASTMONEY_TIMEOUT,
+                        headers={"User-Agent": random.choice(_USER_AGENTS)},
+                        proxies={"http": None, "https": None},
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                except Exception as page_e:
+                    logger.warning("东财 HTTP 涨幅榜第{}页失败: {}", page, page_e)
+                    break
+
+                diff = data.get("data", {}).get("diff")
+                if not diff:
+                    break
+
+                items = diff if isinstance(diff, list) else diff.values()
+                page_count = 0
+                stop = False
+                for item in items:
+                    code = str(item.get("f12", "")).strip()
+                    name = item.get("f14", "")
+                    change_pct = item.get("f3", 0)
+
+                    if not code or not name:
+                        continue
+
+                    # 涨幅 < 阈值, 后面都是更低的, 提前终止
+                    try:
+                        pct = float(change_pct)
+                    except (ValueError, TypeError):
+                        continue
+                    if pct < min_change_pct:
+                        stop = True
+                        break
+
+                    # 过滤科创板/北交所/ST
+                    if self._is_excluded_code(code):
+                        continue
+                    if re.search(r"ST|退|B股", str(name)):
+                        continue
+
+                    all_rows.append({"代码": code, "名称": name, "涨跌幅": pct})
+                    page_count += 1
+
+                if stop or page_count == 0:
+                    break
+                page += 1
+
+            if not all_rows:
+                logger.info("东财涨幅榜: 无涨幅 > {}% 的股票", min_change_pct)
+                return pd.DataFrame()
+
+            df = pd.DataFrame(all_rows)
+            df = df.drop_duplicates(subset=["代码"]).reset_index(drop=True)
+            logger.info(
+                "东财涨幅榜获取成功 | 涨幅 > {}%: {} 只 ({} 页)",
+                min_change_pct, len(df), page,
+            )
+            self._mark_source_success("eastmoney")
+            return df
+
+        except Exception as e:
+            logger.warning("东财 HTTP 涨幅榜获取失败: {}", e)
+            self._mark_source_fail("eastmoney")
+            return pd.DataFrame()
+
+    def _get_a_share_hot_stocks_baostock(self, min_change_pct: float = 5.0) -> pd.DataFrame:
+        """
+        通过 Baostock 获取涨幅 > min_change_pct 的股票
+        1. 获取全市场股票列表
+        2. 过滤科创板/北交所/ST
+        3. 多线程查询每只股票最近交易日涨跌幅 (pctChg)
+        4. 筛选涨幅 > 阈值的股票
+
+        线程安全: 每个 worker 线程独立 Baostock login
+        """
+        # 1. 获取全市场列表
+        df_list = self._get_a_share_stock_list_baostock()
+        if df_list.empty:
+            return pd.DataFrame()
+
+        # 2. 过滤科创板/北交所
+        df_list = df_list[~df_list["代码"].apply(self._is_excluded_code)].reset_index(drop=True)
+        logger.info("Baostock 涨幅筛选: 过滤后 {} 只待查询涨跌幅", len(df_list))
+
+        # 3. 多线程查询涨跌幅
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+
+        def _query_pct(code_name):
+            """查询单只股票最近交易日涨跌幅 (worker 线程)"""
+            code, name = code_name
+            bs = _get_thread_bs_session()
+            if bs is None:
+                return (code, name, None)
+            try:
+                bs_code = self._baostock_code(code)
+                rs = bs.query_history_k_data_plus(
+                    code=bs_code,
+                    fields="date,pctChg",
+                    start_date=start_date,
+                    end_date=end_date,
+                    frequency="d",
+                )
+                if rs.error_code != "0" and rs.error_code != 0:
+                    return (code, name, None)
+                last_pct = None
+                while rs.next():
+                    row = rs.get_row_data()
+                    try:
+                        last_pct = float(row[1])
+                    except (ValueError, TypeError):
+                        pass
+                return (code, name, last_pct)
+            except Exception:
+                return (code, name, None)
+
+        hot_rows = []
+        total = len(df_list)
+        completed = 0
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {
+                executor.submit(_query_pct, (row["代码"], row["名称"])): idx
+                for idx, row in df_list.iterrows()
+            }
+            for future in as_completed(futures):
+                completed += 1
+                code, name, pct = future.result()
+                if pct is not None and pct >= min_change_pct:
+                    hot_rows.append({"代码": code, "名称": name, "涨跌幅": pct})
+                if completed % 500 == 0:
+                    logger.info(
+                        "Baostock 涨幅查询进度: {}/{} ({:.0f}%) | 已筛选出 {} 只",
+                        completed, total, completed / total * 100, len(hot_rows),
+                    )
+
+        if not hot_rows:
+            logger.info("Baostock 涨幅筛选: 无涨幅 > {}% 的股票", min_change_pct)
+            return pd.DataFrame()
+
+        df = pd.DataFrame(hot_rows)
+        df = df.sort_values("涨跌幅", ascending=False).reset_index(drop=True)
+        logger.info(
+            "Baostock 涨幅筛选完成 | 涨幅 > {}%: {} 只 (共查询 {} 只)",
+            min_change_pct, len(df), total,
+        )
+        self._mark_source_success("baostock")
+        return df
+
+    def get_hot_stock_list(self, min_change_pct: float = 5.0) -> list:
+        """
+        获取涨幅 > min_change_pct 的热门股票列表
+        故障切换: 东财HTTP (快速, 按涨幅排序提前终止) → Baostock (多线程, 可靠)
+
+        Returns: [("a_share", code, name), ...]
+        """
+        # 首选: 东财HTTP (按涨幅排序, 只需1-3页)
+        if self._is_source_available("eastmoney"):
+            df = self._get_a_share_hot_stocks_eastmoney(min_change_pct)
+            if not df.empty:
+                return [("a_share", row["代码"], row["名称"]) for _, row in df.iterrows()]
+
+        # 备用: Baostock 多线程查询
+        if self._is_source_available("baostock"):
+            df = self._get_a_share_hot_stocks_baostock(min_change_pct)
+            if not df.empty:
+                return [("a_share", row["代码"], row["名称"]) for _, row in df.iterrows()]
+
+        logger.error("获取涨幅 > {}% 股票列表失败 (所有数据源均不可用)", min_change_pct)
+        return []
         """
         获取A股全市场股票列表
         返回: DataFrame[代码, 名称, 最新价, 涨跌幅, ...]
@@ -1227,13 +1477,27 @@ class DataETL:
     # 统一数据接口
     # ============================================================
 
-    def get_stock_list(self) -> list:
+    def get_stock_list(self, min_change_pct: float = 0.0) -> list:
         """
         获取股票列表 (根据市场自动路由)
+
+        Args:
+            min_change_pct: 最小涨幅过滤 (0=不过滤, >0=只取涨幅超过此值的股票)
+                           涨幅过滤可大幅减少扫描数量 (5000+ → 几十~两百家)
 
         安全处理: 数据源失败时返回空列表, 不抛出 KeyError
         """
         if self.market in ("a_share", "all"):
+            # 涨幅过滤模式: 只扫描涨幅 > min_change_pct 的股票
+            if min_change_pct > 0:
+                hot_list = self.get_hot_stock_list(min_change_pct)
+                if self.market == "a_share":
+                    return hot_list
+                else:
+                    us_codes = self.get_us_stock_list()
+                    return hot_list + [("us_stock", code, code) for code in us_codes]
+
+            # 全量模式 (不过滤涨幅)
             df = self.get_a_share_stock_list()
 
             # 安全检查: 数据源彻底失败时 df 为空 DataFrame (无列)
@@ -1270,30 +1534,58 @@ class DataETL:
         self,
         stock_list: list,
         days: int = 120,
-        rate_limit: float = 0.3,
+        rate_limit: float = 0.05,
+        max_workers: int = 10,
     ) -> dict:
         """
-        批量获取K线数据
+        批量获取K线数据 (多线程并发)
 
         Args:
             stock_list: [(market_type, code, name), ...]
             days: K线天数
-            rate_limit: 每次请求间隔(秒), 避免被封
+            rate_limit: 每次请求间隔(秒), 多线程模式下自动降低
+            max_workers: 最大并发线程数 (Baostock 每个 worker 独立 TCP 连接)
 
         Returns:
-            {symbol: DataFrame}
+            {symbol: {"data": DataFrame, "name": str, "market": str}}
         """
         results = {}
         total = len(stock_list)
 
-        for i, (mtype, code, name) in enumerate(stock_list):
-            df = self.get_kline(mtype, code, days)
-            if not df.empty and len(df) >= 60:
-                results[code] = {"data": df, "name": name, "market": mtype}
+        if total == 0:
+            return results
 
-            if (i + 1) % 100 == 0:
-                logger.info("数据抓取进度: {}/{} ({:.0f}%)", i + 1, total, (i + 1) / total * 100)
-            time.sleep(rate_limit)
+        def _fetch_one(item):
+            """单只股票 K 线获取 (worker 线程, 线程安全)"""
+            mtype, code, name = item
+            try:
+                df = self.get_kline(mtype, code, days)
+                if not df.empty and len(df) >= 60:
+                    return (code, {"data": df, "name": name, "market": mtype})
+            except Exception as e:
+                logger.debug("获取 {} K线异常: {}", code, e)
+            return (code, None)
+
+        # 多线程并发获取
+        actual_workers = min(max_workers, total)
+        logger.info(
+            "开始多线程抓取K线 | {} 只股票, {} 线程, {} 天",
+            total, actual_workers, days,
+        )
+
+        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+            futures = {executor.submit(_fetch_one, item): item for item in stock_list}
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                code, result = future.result()
+                if result is not None:
+                    results[code] = result
+                if completed % 50 == 0 or completed == total:
+                    logger.info(
+                        "数据抓取进度: {}/{} ({:.0f}%) | 成功: {}",
+                        completed, total, completed / total * 100, len(results),
+                    )
 
         logger.info("数据抓取完成 | 成功: {}/{}", len(results), total)
         return results
