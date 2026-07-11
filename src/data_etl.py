@@ -26,11 +26,44 @@ v2.0 新增 -- 数据源故障切换 (Failover):
 """
 
 import time
+import random
+import requests
 import pandas as pd
 import numpy as np
 from loguru import logger
 from datetime import datetime, timedelta
 from typing import Optional
+
+
+# ============================================================
+# 全局 User-Agent 注入 (防止海外 IP 被国内数据源封锁)
+# ============================================================
+
+# 国内常见浏览器 User-Agent 列表
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
+
+# Monkey-patch requests.Session.request, 为所有 HTTP 请求注入浏览器 User-Agent
+# AkShare / efinance 内部使用 requests, 此补丁确保所有请求都带上正常浏览器 UA
+if not getattr(requests.Session.request, '_patched_with_ua', False):
+    _original_session_request = requests.Session.request
+
+    def _patched_session_request(self, method, url, **kwargs):
+        headers = kwargs.get('headers') or {}
+        if not headers.get('User-Agent'):
+            headers['User-Agent'] = random.choice(_USER_AGENTS)
+        kwargs['headers'] = headers
+        return _original_session_request(self, method, url, **kwargs)
+
+    _patched_session_request._patched_with_ua = True
+    requests.Session.request = _patched_session_request
+    logger.debug("User-Agent 全局注入补丁已生效")
 
 
 class DataETL:
@@ -107,49 +140,106 @@ class DataETL:
     # A股数据
     # ============================================================
 
+    # 重试配置
+    MAX_RETRIES = 3
+    RETRY_DELAY_MIN = 2.0   # 重试间隔最小秒数
+    RETRY_DELAY_MAX = 5.0   # 重试间隔最大秒数
+
+    def _retry_delay(self) -> float:
+        """随机延迟, 避免被数据源限流"""
+        return random.uniform(self.RETRY_DELAY_MIN, self.RETRY_DELAY_MAX)
+
     def get_a_share_stock_list(self) -> pd.DataFrame:
         """
         获取A股全市场股票列表 (东财接口)
         返回: DataFrame[代码, 名称, 最新价, 涨跌幅, ...]
 
         故障切换: AkShare → efinance
+        每个数据源最多重试 MAX_RETRIES 次, 重试间隔随机延迟 2-5 秒
+        所有数据源彻底失败时返回空 DataFrame (不含任何列)
         """
-        # 主源: AkShare
+        # 主源: AkShare (带重试)
         if self._is_source_available("akshare"):
-            try:
-                df = self.ak.stock_zh_a_spot_em()
-                # 过滤 ST 和退市股
-                df = df[~df["名称"].str.contains(r"ST|退|B股", na=False)]
-                logger.info("A股股票列表获取成功 (AkShare) | 共 {} 只股票", len(df))
-                self._mark_source_success("akshare")
-                return df
-            except Exception as e:
-                logger.warning("AkShare 获取股票列表失败, 切换备用源: {}", e)
-                self._mark_source_fail("akshare")
-
-        # 备用源: efinance
-        if self._is_source_available("efinance"):
-            try:
-                df = self.ef.stock.get_realtime_quotes()
-                if df is not None and not df.empty:
-                    # efinance 列名映射
-                    col_map = {}
-                    if "股票代码" in df.columns:
-                        col_map["股票代码"] = "代码"
-                    if "股票名称" in df.columns:
-                        col_map["股票名称"] = "名称"
-                    df = df.rename(columns=col_map)
-                    # 过滤 ST 和退市股
-                    if "名称" in df.columns:
+            for attempt in range(self.MAX_RETRIES):
+                try:
+                    df = self.ak.stock_zh_a_spot_em()
+                    if df is not None and not df.empty:
+                        # 过滤 ST 和退市股
                         df = df[~df["名称"].str.contains(r"ST|退|B股", na=False)]
-                    logger.info("A股股票列表获取成功 (efinance) | 共 {} 只股票", len(df))
-                    self._mark_source_success("efinance")
-                    return df
-            except Exception as e:
-                logger.error("efinance 获取股票列表也失败: {}", e)
-                self._mark_source_fail("efinance")
+                        logger.info(
+                            "A股股票列表获取成功 (AkShare) | 共 {} 只股票 (第{}次尝试)",
+                            len(df), attempt + 1,
+                        )
+                        self._mark_source_success("akshare")
+                        return df
+                    else:
+                        logger.warning(
+                            "AkShare 返回空数据 (第{}/{}次)",
+                            attempt + 1, self.MAX_RETRIES,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "AkShare 获取股票列表失败 (第{}/{}次): {}",
+                        attempt + 1, self.MAX_RETRIES, e,
+                    )
 
-        logger.error("所有数据源获取A股股票列表均失败")
+                # 未达最大重试次数, 等待后重试
+                if attempt < self.MAX_RETRIES - 1:
+                    delay = self._retry_delay()
+                    logger.info("等待 {:.1f}s 后重试 AkShare...", delay)
+                    time.sleep(delay)
+
+            logger.warning(
+                "AkShare 连续 {} 次重试均失败, 切换备用源 efinance",
+                self.MAX_RETRIES,
+            )
+            self._mark_source_fail("akshare")
+
+        # 备用源: efinance (带重试)
+        if self._is_source_available("efinance"):
+            for attempt in range(self.MAX_RETRIES):
+                try:
+                    df = self.ef.stock.get_realtime_quotes()
+                    if df is not None and not df.empty:
+                        # efinance 列名映射
+                        col_map = {}
+                        if "股票代码" in df.columns:
+                            col_map["股票代码"] = "代码"
+                        if "股票名称" in df.columns:
+                            col_map["股票名称"] = "名称"
+                        df = df.rename(columns=col_map)
+                        # 过滤 ST 和退市股
+                        if "名称" in df.columns:
+                            df = df[~df["名称"].str.contains(r"ST|退|B股", na=False)]
+                        logger.info(
+                            "A股股票列表获取成功 (efinance) | 共 {} 只股票 (第{}次尝试)",
+                            len(df), attempt + 1,
+                        )
+                        self._mark_source_success("efinance")
+                        return df
+                    else:
+                        logger.warning(
+                            "efinance 返回空数据 (第{}/{}次)",
+                            attempt + 1, self.MAX_RETRIES,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "efinance 获取股票列表失败 (第{}/{}次): {}",
+                        attempt + 1, self.MAX_RETRIES, e,
+                    )
+
+                # 未达最大重试次数, 等待后重试
+                if attempt < self.MAX_RETRIES - 1:
+                    delay = self._retry_delay()
+                    logger.info("等待 {:.1f}s 后重试 efinance...", delay)
+                    time.sleep(delay)
+
+            logger.error(
+                "efinance 连续 {} 次重试均失败", self.MAX_RETRIES,
+            )
+            self._mark_source_fail("efinance")
+
+        logger.error("所有数据源获取A股股票列表均失败 (已重试 {} 次/源)", self.MAX_RETRIES)
         return pd.DataFrame()
 
     def get_a_share_kline(
@@ -414,55 +504,83 @@ class DataETL:
         获取沪深300指数历史K线数据 (用于 Beta Filter)
 
         故障切换: AkShare index_daily → efinance 指数接口
+        每个数据源最多重试 MAX_RETRIES 次
 
         Returns:
             标准化 DataFrame: [date, close, open, high, low, volume]
         """
-        # 主源: AkShare
+        # 主源: AkShare (带重试)
         if self._is_source_available("akshare"):
-            try:
-                df = self.ak.stock_zh_index_daily(symbol="sh000300")
-                if df is not None and not df.empty:
-                    df = df.rename(columns={
-                        "date": "date", "close": "close", "open": "open",
-                        "high": "high", "low": "low", "volume": "volume",
-                    })
-                    df["date"] = pd.to_datetime(df["date"])
-                    df = df.sort_values("date").reset_index(drop=True)
-                    df = df.tail(days).reset_index(drop=True)
-                    logger.info("沪深300指数数据获取成功 (AkShare) | {} 日", len(df))
-                    self._mark_source_success("akshare")
-                    return df
-            except Exception as e:
-                logger.warning("AkShare 获取沪深300指数失败, 切换备用源: {}", e)
-                self._mark_source_fail("akshare")
+            for attempt in range(self.MAX_RETRIES):
+                try:
+                    df = self.ak.stock_zh_index_daily(symbol="sh000300")
+                    if df is not None and not df.empty:
+                        df = df.rename(columns={
+                            "date": "date", "close": "close", "open": "open",
+                            "high": "high", "low": "low", "volume": "volume",
+                        })
+                        df["date"] = pd.to_datetime(df["date"])
+                        df = df.sort_values("date").reset_index(drop=True)
+                        df = df.tail(days).reset_index(drop=True)
+                        logger.info(
+                            "沪深300指数数据获取成功 (AkShare) | {} 日 (第{}次尝试)",
+                            len(df), attempt + 1,
+                        )
+                        self._mark_source_success("akshare")
+                        return df
+                except Exception as e:
+                    logger.warning(
+                        "AkShare 获取沪深300指数失败 (第{}/{}次): {}",
+                        attempt + 1, self.MAX_RETRIES, e,
+                    )
 
-        # 备用源: efinance
+                if attempt < self.MAX_RETRIES - 1:
+                    delay = self._retry_delay()
+                    logger.info("等待 {:.1f}s 后重试 AkShare 指数...", delay)
+                    time.sleep(delay)
+
+            logger.warning("AkShare 指数连续 {} 次失败, 切换 efinance", self.MAX_RETRIES)
+            self._mark_source_fail("akshare")
+
+        # 备用源: efinance (带重试)
         if self._is_source_available("efinance"):
-            try:
-                # efinance 指数接口
-                df = self.ef.stock.get_quote_history(
-                    stock_codes="000300",
-                    klt=101,
-                    fqt=0,
-                )
-                if df is not None and not df.empty:
-                    col_map = {
-                        "日期": "date", "开盘": "open", "收盘": "close",
-                        "最高": "high", "最低": "low", "成交量": "volume",
-                    }
-                    df = df.rename(columns=col_map)
-                    cols = ["date", "open", "high", "low", "close", "volume"]
-                    df = df[[c for c in cols if c in df.columns]].copy()
-                    df["date"] = pd.to_datetime(df["date"])
-                    df = df.sort_values("date").reset_index(drop=True)
-                    df = df.tail(days).reset_index(drop=True)
-                    logger.info("沪深300指数数据获取成功 (efinance) | {} 日", len(df))
-                    self._mark_source_success("efinance")
-                    return df
-            except Exception as e:
-                logger.error("efinance 获取沪深300指数也失败: {}", e)
-                self._mark_source_fail("efinance")
+            for attempt in range(self.MAX_RETRIES):
+                try:
+                    df = self.ef.stock.get_quote_history(
+                        stock_codes="000300",
+                        klt=101,
+                        fqt=0,
+                    )
+                    if df is not None and not df.empty:
+                        col_map = {
+                            "日期": "date", "开盘": "open", "收盘": "close",
+                            "最高": "high", "最低": "low", "成交量": "volume",
+                        }
+                        df = df.rename(columns=col_map)
+                        cols = ["date", "open", "high", "low", "close", "volume"]
+                        df = df[[c for c in cols if c in df.columns]].copy()
+                        df["date"] = pd.to_datetime(df["date"])
+                        df = df.sort_values("date").reset_index(drop=True)
+                        df = df.tail(days).reset_index(drop=True)
+                        logger.info(
+                            "沪深300指数数据获取成功 (efinance) | {} 日 (第{}次尝试)",
+                            len(df), attempt + 1,
+                        )
+                        self._mark_source_success("efinance")
+                        return df
+                except Exception as e:
+                    logger.warning(
+                        "efinance 获取沪深300指数失败 (第{}/{}次): {}",
+                        attempt + 1, self.MAX_RETRIES, e,
+                    )
+
+                if attempt < self.MAX_RETRIES - 1:
+                    delay = self._retry_delay()
+                    logger.info("等待 {:.1f}s 后重试 efinance 指数...", delay)
+                    time.sleep(delay)
+
+            logger.error("efinance 指数连续 {} 次失败", self.MAX_RETRIES)
+            self._mark_source_fail("efinance")
 
         logger.error("所有数据源获取沪深300指数均失败")
         return pd.DataFrame()
@@ -529,17 +647,34 @@ class DataETL:
     # ============================================================
 
     def get_stock_list(self) -> list:
-        """获取股票列表 (根据市场自动路由)"""
+        """
+        获取股票列表 (根据市场自动路由)
+
+        安全处理: 数据源失败时返回空列表, 不抛出 KeyError
+        """
         if self.market in ("a_share", "all"):
             df = self.get_a_share_stock_list()
-            a_codes = df["代码"].tolist() if not df.empty else []
+
+            # 安全检查: 数据源彻底失败时 df 为空 DataFrame (无列)
+            # 此时绝不能访问 df["代码"], 否则触发 KeyError
+            if df is None or df.empty or "代码" not in df.columns:
+                logger.error("A股股票列表获取失败 (数据源不可用), 返回空列表")
+                if self.market == "a_share":
+                    return []
+                # all 模式下仍可返回美股内置列表
+                us_codes = self.get_us_stock_list()
+                return [("us_stock", code, code) for code in us_codes]
+
             if self.market == "a_share":
-                return [("a_share", code, name) for code, name in
-                        zip(df["代码"], df["名称"]) if not df.empty]
+                return [
+                    ("a_share", code, name)
+                    for code, name in zip(df["代码"], df["名称"])
+                ]
+
+            # all 模式: A股 + 美股
             us_codes = self.get_us_stock_list()
             return (
-                [("a_share", code, name) for code, name in
-                 zip(df["代码"], df["名称"]) if not df.empty]
+                [("a_share", code, name) for code, name in zip(df["代码"], df["名称"])]
                 + [("us_stock", code, code) for code in us_codes]
             )
         else:

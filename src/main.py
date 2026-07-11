@@ -166,15 +166,26 @@ def run_pipeline(force: bool = False, dry_run: bool = False):
                 stock_list.append(("us_stock", code, code))
         logger.info("使用自定义股票池: {} 只", len(stock_list))
     else:
-        stock_list = etl.get_stock_list()
-        logger.info("全市场扫描: {} 只股票", len(stock_list))
+        try:
+            stock_list = etl.get_stock_list()
+        except Exception as e:
+            logger.error("获取股票列表时发生异常: {}", e)
+            stock_list = []
+
+    # 数据源连接失败时优雅退出, 不崩溃
+    if not stock_list:
+        logger.error("数据源连接失败，本次扫描跳过")
+        if not dry_run:
+            _send_data_failure_alert(market)
+        return None
+
+    logger.info("全市场扫描: {} 只股票", len(stock_list))
 
     # 获取 200 日数据 (MA120 需要 120 日 + 余量)
     stock_data = etl.batch_fetch(stock_list, days=200, rate_limit=0.15)
 
     if not stock_data:
-        logger.error("数据抓取失败 (所有数据源均不可用), 流水线终止")
-        # 即使数据获取失败也发送告警
+        logger.error("数据源连接失败，本次扫描跳过")
         if not dry_run:
             _send_data_failure_alert(market)
         return None
@@ -244,7 +255,9 @@ def _send_data_failure_alert(market: str):
             f"**[数据源故障告警]**\n\n"
             f"时间: {now}\n"
             f"市场: {market}\n\n"
-            f"所有数据源均不可用, 扫描流水线终止。\n"
+            f"所有数据源 (AkShare + efinance) 均不可用, "
+            f"已重试 3 次仍失败。\n"
+            f"本次扫描已跳过, 等待下次定时触发自动恢复。\n"
             f"请检查网络连接或数据源 API 状态。"
         )
         if notifier.tg_token and notifier.tg_chat_id:

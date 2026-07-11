@@ -25,12 +25,40 @@ import gc
 import glob
 import time
 import json
+import random
 import shutil
+import requests
 import traceback
 from datetime import datetime, timedelta, date
 from typing import Optional, Callable, Any
 from loguru import logger
 from functools import wraps
+
+
+# ============================================================
+# 全局 User-Agent 注入 (防止海外 IP 被国内数据源封锁)
+# ============================================================
+
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+]
+
+# Monkey-patch requests.Session.request (与 data_etl.py 共享, 幂等不重复打补丁)
+if not getattr(requests.Session.request, '_patched_with_ua', False):
+    _original_session_request = requests.Session.request
+
+    def _patched_session_request(self, method, url, **kwargs):
+        headers = kwargs.get('headers') or {}
+        if not headers.get('User-Agent'):
+            headers['User-Agent'] = random.choice(_USER_AGENTS)
+        kwargs['headers'] = headers
+        return _original_session_request(self, method, url, **kwargs)
+
+    _patched_session_request._patched_with_ua = True
+    requests.Session.request = _patched_session_request
 
 
 # ============================================================
