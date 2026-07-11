@@ -303,6 +303,32 @@ def health_check(market: str = "a_share") -> dict:
     """
     results = {}
 
+    # Baostock (TCP socket, 海外可用, 第一优先级)
+    try:
+        start = time.time()
+        import baostock as bs
+        lg = bs.login()
+        if lg.error_code == '0' or lg.error_code == 0:
+            rs = bs.query_stock_basic()
+            count = 0
+            while (rs.error_code == '0' or rs.error_code == 0) and rs.next():
+                count += 1
+            latency = int((time.time() - start) * 1000)
+            results["baostock"] = {
+                "available": count > 0,
+                "latency_ms": latency,
+                "rows": count,
+                "error": "",
+            }
+            logger.info("Baostock 健康检查 PASS | {}ms | {} 行", latency, count)
+        else:
+            results["baostock"] = {"available": False, "latency_ms": 0, "error": lg.error_msg}
+            logger.warning("Baostock 健康检查 FAIL | {}", lg.error_msg)
+        bs.logout()
+    except Exception as e:
+        results["baostock"] = {"available": False, "latency_ms": 0, "error": str(e)}
+        logger.warning("Baostock 健康检查 FAIL | {}", e)
+
     # AkShare
     try:
         start = time.time()

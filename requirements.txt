@@ -3,6 +3,8 @@
 # ============================================================
 # 数据获取层 (Data ETL) -- 主源 + 备用源故障切换
 # ------------------------------------------------------------
+baostock>=0.8.8           # A股数据 (TCP socket直连, 海外IP不被风控, GitHub Actions首选)
+                           # https://github.com/baostock/baostock
 akshare>=1.16.19          # A股/港股/期货/宏观数据 (免费无需Token)
                            # https://github.com/akfamily/akshare (21.2k stars)
 efinance>=0.5.0           # A股备用数据源 (AkShare故障时自动切换)

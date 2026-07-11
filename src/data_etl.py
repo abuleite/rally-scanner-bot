@@ -75,6 +75,7 @@ class DataETL:
     SOURCE_EFINANCE = True
     SOURCE_YFINANCE = True
     SOURCE_EASTMONEY = True
+    SOURCE_BAOSTOCK = True
 
     # 请求超时 (秒) -- 超过此时间判定为数据源不可用
     REQUEST_TIMEOUT = 30
@@ -87,8 +88,10 @@ class DataETL:
         self._ak = None
         self._yf = None
         self._ef = None
+        self._bs = None
+        self._bs_logged_in = False
         # 数据源故障计数器 (连续失败 N 次后暂时跳过)
-        self._fail_counts = {"akshare": 0, "efinance": 0, "yfinance": 0, "eastmoney": 0, "tencent": 0, "sina": 0}
+        self._fail_counts = {"baostock": 0, "akshare": 0, "efinance": 0, "yfinance": 0, "eastmoney": 0, "tencent": 0, "sina": 0}
         self._FAIL_THRESHOLD = 3
 
     @property
@@ -152,6 +155,195 @@ class DataETL:
     def _retry_delay(self) -> float:
         """随机延迟, 避免被数据源限流"""
         return random.uniform(self.RETRY_DELAY_MIN, self.RETRY_DELAY_MAX)
+
+    # ============================================================
+    # Baostock 数据源 (TCP socket 直连, 海外 IP 不被风控, GitHub Actions 首选)
+    # ============================================================
+
+    def _baostock_login(self):
+        """懒加载并登录 Baostock (整个生命周期只登录一次)"""
+        if self._bs_logged_in:
+            return True
+        try:
+            import baostock as bs
+            self._bs = bs
+            lg = bs.login()
+            if lg.error_code == '0' or lg.error_code == 0:
+                self._bs_logged_in = True
+                logger.info("Baostock 登录成功 (TCP socket, 海外可用)")
+                return True
+            else:
+                logger.warning("Baostock 登录失败: {}", lg.error_msg)
+                self._mark_source_fail("baostock")
+                return False
+        except ImportError:
+            logger.warning("baostock 未安装, 跳过此数据源 (pip install baostock)")
+            self._mark_source_fail("baostock")
+            return False
+        except Exception as e:
+            logger.warning("Baostock 登录异常: {}", e)
+            self._mark_source_fail("baostock")
+            return False
+
+    def _baostock_logout(self):
+        """登出 Baostock"""
+        if self._bs_logged_in and self._bs:
+            try:
+                self._bs.logout()
+                self._bs_logged_in = False
+            except Exception:
+                pass
+
+    @staticmethod
+    def _baostock_code(symbol: str) -> str:
+        """将纯数字代码转换为 Baostock 格式 (sh.600519 / sz.000001)"""
+        symbol = symbol.strip()
+        if symbol.startswith(("sh.", "sz.")):
+            return symbol
+        if symbol.startswith("6"):
+            return f"sh.{symbol}"
+        return f"sz.{symbol}"
+
+    def _get_a_share_stock_list_baostock(self) -> pd.DataFrame:
+        """
+        通过 Baostock 获取 A 股全市场股票列表
+        返回: DataFrame[代码, 名称]
+        """
+        if not self._baostock_login():
+            return pd.DataFrame()
+        try:
+            rs = self._bs.query_stock_basic()
+            if rs.error_code != '0' and rs.error_code != 0:
+                logger.warning("Baostock 获取股票列表失败: {}", rs.error_msg)
+                self._mark_source_fail("baostock")
+                return pd.DataFrame()
+
+            data_list = []
+            while (rs.error_code == '0' or rs.error_code == 0) and rs.next():
+                data_list.append(rs.get_row_data())
+
+            if not data_list:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(data_list, columns=rs.fields)
+            # type=1 是股票, type=2 是指数
+            df = df[df["type"] == "1"].copy()
+            # 只保留上市状态 (status=1)
+            df = df[df["status"] == "1"].copy()
+            # 代码格式: sh.600519 -> 600519
+            df["代码"] = df["code"].str.split(".").str[1]
+            df["名称"] = df["code_name"]
+            # 过滤 ST 和退市
+            df = df[~df["名称"].str.contains(r"ST|退|B股", na=False)]
+
+            logger.info("A股股票列表获取成功 (Baostock) | 共 {} 只股票", len(df))
+            self._mark_source_success("baostock")
+            return df[["代码", "名称"]].reset_index(drop=True)
+
+        except Exception as e:
+            logger.warning("Baostock 获取股票列表异常: {}", e)
+            self._mark_source_fail("baostock")
+            return pd.DataFrame()
+
+    def _get_a_share_kline_baostock(
+        self, symbol: str, days: int, adjust: str = "qfq"
+    ) -> pd.DataFrame:
+        """
+        通过 Baostock 获取 A 股个股历史 K 线
+        TCP socket 连接, 海外 IP 不被风控
+        """
+        if not self._baostock_login():
+            return pd.DataFrame()
+        try:
+            bs_code = self._baostock_code(symbol)
+            # adjustflag: 1=后复权, 2=前复权, 3=不复权
+            adjust_map = {"qfq": "2", "hfq": "1", "": "3"}
+            adjustflag = adjust_map.get(adjust, "2")
+
+            end_date = datetime.now().strftime("%Y-%m-%d")
+            start_date = (datetime.now() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
+
+            rs = self._bs.query_history_k_data_plus(
+                code=bs_code,
+                fields="date,code,open,high,low,close,volume,amount,turn,pctChg,preclose",
+                start_date=start_date,
+                end_date=end_date,
+                frequency="d",
+                adjustflag=adjustflag,
+            )
+            if rs.error_code != '0' and rs.error_code != 0:
+                logger.debug("Baostock 获取 {} K线失败: {}", symbol, rs.error_msg)
+                self._mark_source_fail("baostock")
+                return pd.DataFrame()
+
+            data_list = []
+            while (rs.error_code == '0' or rs.error_code == 0) and rs.next():
+                data_list.append(rs.get_row_data())
+
+            if not data_list:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(data_list, columns=rs.fields)
+            # 转换数据类型
+            for col in ["open", "high", "low", "close", "volume", "amount"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date").reset_index(drop=True)
+            df = df.tail(days).reset_index(drop=True)
+
+            logger.debug("Baostock K线 {} | {} 条", symbol, len(df))
+            self._mark_source_success("baostock")
+            return df[["date", "open", "high", "low", "close", "volume", "amount"]]
+
+        except Exception as e:
+            logger.debug("Baostock 获取 {} K线异常: {}", symbol, e)
+            self._mark_source_fail("baostock")
+            return pd.DataFrame()
+
+    def _get_a_share_index_baostock(self, days: int = 200) -> pd.DataFrame:
+        """
+        通过 Baostock 获取沪深300指数历史 K 线
+        """
+        if not self._baostock_login():
+            return pd.DataFrame()
+        try:
+            end_date = datetime.now().strftime("%Y-%m-%d")
+            start_date = (datetime.now() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
+
+            rs = self._bs.query_history_k_data_plus(
+                code="sh.000300",
+                fields="date,code,open,high,low,close,volume,amount",
+                start_date=start_date,
+                end_date=end_date,
+                frequency="d",
+            )
+            if rs.error_code != '0' and rs.error_code != 0:
+                logger.warning("Baostock 获取沪深300指数失败: {}", rs.error_msg)
+                self._mark_source_fail("baostock")
+                return pd.DataFrame()
+
+            data_list = []
+            while (rs.error_code == '0' or rs.error_code == 0) and rs.next():
+                data_list.append(rs.get_row_data())
+
+            if not data_list:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(data_list, columns=rs.fields)
+            for col in ["open", "high", "low", "close", "volume", "amount"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date").reset_index(drop=True)
+            df = df.tail(days).reset_index(drop=True)
+
+            logger.info("沪深300指数数据获取成功 (Baostock) | {} 日", len(df))
+            self._mark_source_success("baostock")
+            return df[["date", "open", "high", "low", "close", "volume"]]
+
+        except Exception as e:
+            logger.warning("Baostock 获取沪深300指数异常: {}", e)
+            self._mark_source_fail("baostock")
+            return pd.DataFrame()
 
     # ============================================================
     # 东财 HTTP 接口 (纯 requests, 无需额外库, GitHub Actions 友好)
@@ -502,11 +694,18 @@ class DataETL:
         获取A股全市场股票列表
         返回: DataFrame[代码, 名称, 最新价, 涨跌幅, ...]
 
-        故障切换: AkShare → efinance → 东财HTTP
+        故障切换: Baostock → AkShare → efinance → 东财HTTP
+        Baostock 为第一优先级 (TCP socket, 海外 IP 不被风控)
         每个数据源最多重试 MAX_RETRIES 次, 重试间隔随机延迟 2-5 秒
         所有数据源彻底失败时返回空 DataFrame
         """
-        # 主源: AkShare (带重试)
+        # 首选源: Baostock (TCP socket, 海外可用, 无需注册)
+        if self._is_source_available("baostock"):
+            df = self._get_a_share_stock_list_baostock()
+            if not df.empty:
+                return df
+
+        # 备用源1: AkShare (带重试)
         if self._is_source_available("akshare"):
             for attempt in range(self.MAX_RETRIES):
                 try:
@@ -603,7 +802,8 @@ class DataETL:
         """
         获取A股个股历史K线数据 (前复权)
 
-        故障切换: AkShare → efinance → 东财HTTP → 腾讯HTTP → 新浪HTTP
+        故障切换: Baostock → AkShare → efinance → 东财HTTP → 腾讯HTTP → 新浪HTTP
+        Baostock 为第一优先级 (TCP socket, 海外 IP 不被风控)
 
         Args:
             symbol: 股票代码, 如 "000001"
@@ -616,7 +816,13 @@ class DataETL:
         end_date = datetime.now().strftime("%Y%m%d")
         start_date = (datetime.now() - timedelta(days=days * 2)).strftime("%Y%m%d")
 
-        # 主源: AkShare
+        # 首选源: Baostock (TCP socket, 海外可用)
+        if self._is_source_available("baostock"):
+            df = self._get_a_share_kline_baostock(symbol, days, adjust)
+            if not df.empty:
+                return df
+
+        # 备用源1: AkShare
         if self._is_source_available("akshare"):
             df = self._fetch_a_share_kline_akshare(symbol, days, start_date, end_date, adjust)
             if not df.empty:
@@ -864,13 +1070,20 @@ class DataETL:
         """
         获取沪深300指数历史K线数据 (用于 Beta Filter)
 
-        故障切换: AkShare → efinance → 东财HTTP
+        故障切换: Baostock → AkShare → efinance → 东财HTTP
+        Baostock 为第一优先级 (TCP socket, 海外 IP 不被风控)
         每个数据源最多重试 MAX_RETRIES 次
 
         Returns:
             标准化 DataFrame: [date, close, open, high, low, volume]
         """
-        # 主源: AkShare (带重试)
+        # 首选源: Baostock (TCP socket, 海外可用)
+        if self._is_source_available("baostock"):
+            df = self._get_a_share_index_baostock(days)
+            if not df.empty:
+                return df
+
+        # 备用源1: AkShare (带重试)
         if self._is_source_available("akshare"):
             for attempt in range(self.MAX_RETRIES):
                 try:
