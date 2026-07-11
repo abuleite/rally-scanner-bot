@@ -1,0 +1,29 @@
+# 环境变量 (包含敏感 Token, 不入库)
+configs/.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 日志
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db

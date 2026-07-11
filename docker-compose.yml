@@ -1,0 +1,50 @@
+# ============================================================
+# 主升浪加速行情自动扫描 Bot - Docker Compose 一键部署
+# ============================================================
+# 使用方式:
+#   1. 准备配置文件:
+#      cp configs/config.example.env configs/.env
+#      # 编辑 configs/.env 填入你的 Token
+#
+#   2. 一键启动 24/7 守护进程:
+#      docker-compose up -d
+#
+#   3. 查看日志:
+#      docker-compose logs -f scanner
+#
+#   4. 手动触发单次扫描:
+#      docker-compose run --rm scanner python src/main.py --force
+#
+#   5. 停止:
+#      docker-compose down
+# ============================================================
+
+version: "3.8"
+
+services:
+  scanner:
+    build: .
+    container_name: rally-scanner-bot
+    restart: unless-stopped
+    env_file:
+      - configs/.env
+    volumes:
+      # 持久化日志 (防止容器重建后丢失)
+      - ./logs:/app/logs
+      - ./data:/app/data
+      # 配置文件 (修改 .env 后无需重建镜像)
+      - ./configs/.env:/app/configs/.env:ro
+    environment:
+      - TZ=Asia/Shanghai
+      - PYTHONPATH=/app/src
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health || true"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
