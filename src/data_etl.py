@@ -88,7 +88,7 @@ class DataETL:
         self._yf = None
         self._ef = None
         # 数据源故障计数器 (连续失败 N 次后暂时跳过)
-        self._fail_counts = {"akshare": 0, "efinance": 0, "yfinance": 0, "eastmoney": 0}
+        self._fail_counts = {"akshare": 0, "efinance": 0, "yfinance": 0, "eastmoney": 0, "tencent": 0, "sina": 0}
         self._FAIL_THRESHOLD = 3
 
     @property
@@ -169,12 +169,11 @@ class DataETL:
     def _get_a_share_stock_list_eastmoney(self) -> pd.DataFrame:
         """
         通过东方财富 HTTP 接口获取 A 股全市场股票列表
+        东财接口每次最多返回 100 条, 需分页获取全部 ~5500 只
         返回: DataFrame[代码, 名称, 最新价, 涨跌幅]
         """
         url = "http://push2.eastmoney.com/api/qt/clist/get"
-        params = {
-            "pn": 1,
-            "pz": 5000,          # 每页 5000 条, 足够覆盖全市场
+        base_params = {
             "po": 1,
             "np": 1,
             "fltt": 2,
@@ -184,41 +183,61 @@ class DataETL:
             "fields": "f12,f14,f2,f3",  # 代码, 名称, 最新价, 涨跌幅
         }
         try:
-            resp = requests.get(
-                url, params=params,
-                timeout=self.EASTMONEY_TIMEOUT,
-                headers={"User-Agent": random.choice(_USER_AGENTS)},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            all_rows = []
+            page = 1
+            total = 0
+            while True:
+                try:
+                    params = {**base_params, "pn": page, "pz": 100}
+                    resp = requests.get(
+                        url, params=params,
+                        timeout=self.EASTMONEY_TIMEOUT,
+                        headers={"User-Agent": random.choice(_USER_AGENTS)},
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                except Exception as page_e:
+                    logger.warning("东财 HTTP 第{}页获取失败: {}, 已获取{}条", page, page_e, len(all_rows))
+                    break
 
-            diff = data.get("data", {}).get("diff")
-            if not diff:
-                logger.warning("东财 HTTP 返回 diff 为空")
+                if page == 1:
+                    total = data.get("data", {}).get("total", 0)
+                    logger.info("东财 HTTP 股票列表 total={} 开始分页获取", total)
+
+                diff = data.get("data", {}).get("diff")
+                if not diff:
+                    break
+
+                items = diff if isinstance(diff, list) else diff.values()
+                page_count = 0
+                for item in items:
+                    code = str(item.get("f12", "")).strip()
+                    name = item.get("f14", "")
+                    if not code or not name:
+                        continue
+                    all_rows.append({
+                        "代码": code,
+                        "名称": name,
+                        "最新价": item.get("f2", 0),
+                        "涨跌幅": item.get("f3", 0),
+                    })
+                    page_count += 1
+
+                if page_count == 0 or len(all_rows) >= total:
+                    break
+                page += 1
+
+            if not all_rows:
                 return pd.DataFrame()
 
-            rows = []
-            for item in diff.values():
-                code = str(item.get("f12", "")).strip()
-                name = item.get("f14", "")
-                if not code or not name:
-                    continue
-                rows.append({
-                    "代码": code,
-                    "名称": name,
-                    "最新价": item.get("f2", 0),
-                    "涨跌幅": item.get("f3", 0),
-                })
-
-            if not rows:
-                return pd.DataFrame()
-
-            df = pd.DataFrame(rows)
+            df = pd.DataFrame(all_rows)
+            # 去重 (分页可能有边界重复)
+            df = df.drop_duplicates(subset=["代码"]).reset_index(drop=True)
             # 过滤 ST 和退市股
             df = df[~df["名称"].str.contains(r"ST|退|B股", na=False)]
             logger.info(
-                "A股股票列表获取成功 (东财HTTP) | 共 {} 只股票",
-                len(df),
+                "A股股票列表获取成功 (东财HTTP) | 共 {} 只股票 ({} 页)",
+                len(df), page,
             )
             self._mark_source_success("eastmoney")
             return df
@@ -352,6 +371,124 @@ class DataETL:
             return pd.DataFrame()
 
     # ============================================================
+    # 腾讯财经 HTTP 接口 (纯 requests, 额外 K 线备选)
+    # ============================================================
+
+    @staticmethod
+    def _tencent_symbol(code: str) -> str:
+        """A股代码转腾讯格式: 6开头=sh, 其余=sz"""
+        prefix = "sh" if code.startswith("6") else "sz"
+        return f"{prefix}{code}"
+
+    def _get_a_share_kline_tencent(
+        self, symbol: str, days: int, adjust: str
+    ) -> pd.DataFrame:
+        """通过腾讯财经 HTTP 接口获取 A 股 K 线数据"""
+        tcode = self._tencent_symbol(symbol)
+        fqt = "qfq" if adjust == "qfq" else ("hfq" if adjust == "hfq" else "")
+        # 腾讯接口 param 格式: {code},day,,, {count}, {fqt}
+        url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+        params = {"param": f"{tcode},day,,,{days * 2},{fqt}"}
+        try:
+            resp = requests.get(
+                url, params=params,
+                timeout=self.EASTMONEY_TIMEOUT,
+                headers={"User-Agent": random.choice(_USER_AGENTS)},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            stock_data = data.get("data", {}).get(tcode, {})
+            # 优先取前复权/后复权数据, 没有则取原始数据
+            klines = stock_data.get(fqt) or stock_data.get("day", [])
+            if not klines:
+                logger.debug("腾讯 HTTP {} K线返回空", symbol)
+                return pd.DataFrame()
+
+            # 腾讯格式: [date, open, close, high, low, volume]
+            rows = []
+            for kline in klines:
+                if len(kline) < 6:
+                    continue
+                rows.append({
+                    "date": kline[0],
+                    "open": float(kline[1]),
+                    "close": float(kline[2]),
+                    "high": float(kline[3]),
+                    "low": float(kline[4]),
+                    "volume": float(kline[5]),
+                    "amount": float(kline[6]) if len(kline) > 6 else 0,
+                })
+
+            df = pd.DataFrame(rows)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date").reset_index(drop=True)
+            df = df.tail(days).reset_index(drop=True)
+            logger.debug("腾讯 HTTP 获取 {} K线成功 | {} 条", symbol, len(df))
+            self._mark_source_success("tencent")
+            return df
+
+        except Exception as e:
+            logger.debug("腾讯 HTTP 获取 {} K线失败: {}", symbol, e)
+            self._mark_source_fail("tencent")
+            return pd.DataFrame()
+
+    # ============================================================
+    # 新浪财经 HTTP 接口 (纯 requests, 额外 K 线备选)
+    # ============================================================
+
+    def _get_a_share_kline_sina(
+        self, symbol: str, days: int
+    ) -> pd.DataFrame:
+        """通过新浪财经 HTTP 接口获取 A 股 K 线数据 (仅日线不复权)"""
+        scode = self._tencent_symbol(symbol)  # 新浪格式与腾讯相同
+        url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+        params = {
+            "symbol": scode,
+            "scale": "240",       # 日线
+            "datalen": str(days * 2),
+            "ma": "no",
+        }
+        try:
+            resp = requests.get(
+                url, params=params,
+                timeout=self.EASTMONEY_TIMEOUT,
+                headers={"User-Agent": random.choice(_USER_AGENTS)},
+            )
+            resp.raise_for_status()
+            import json as _json
+            klines = _json.loads(resp.text)
+            if not klines:
+                logger.debug("新浪 HTTP {} K线返回空", symbol)
+                return pd.DataFrame()
+
+            # 新浪格式: [{day, open, high, low, close, volume}, ...]
+            rows = []
+            for item in klines:
+                rows.append({
+                    "date": item.get("day", ""),
+                    "open": float(item.get("open", 0)),
+                    "high": float(item.get("high", 0)),
+                    "low": float(item.get("low", 0)),
+                    "close": float(item.get("close", 0)),
+                    "volume": float(item.get("volume", 0)),
+                    "amount": 0,
+                })
+
+            df = pd.DataFrame(rows)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date").reset_index(drop=True)
+            df = df.tail(days).reset_index(drop=True)
+            logger.debug("新浪 HTTP 获取 {} K线成功 | {} 条", symbol, len(df))
+            self._mark_source_success("sina")
+            return df
+
+        except Exception as e:
+            logger.debug("新浪 HTTP 获取 {} K线失败: {}", symbol, e)
+            self._mark_source_fail("sina")
+            return pd.DataFrame()
+
+    # ============================================================
     # A股数据
     # ============================================================
 
@@ -461,7 +598,7 @@ class DataETL:
         """
         获取A股个股历史K线数据 (前复权)
 
-        故障切换: AkShare → efinance → 东财HTTP
+        故障切换: AkShare → efinance → 东财HTTP → 腾讯HTTP → 新浪HTTP
 
         Args:
             symbol: 股票代码, 如 "000001"
@@ -490,9 +627,21 @@ class DataETL:
                 self._mark_source_success("efinance")
                 return df
 
-        # 兜底源: 东财 HTTP
+        # 兜底源1: 东财 HTTP
         if self._is_source_available("eastmoney"):
             df = self._get_a_share_kline_eastmoney(symbol, days, adjust)
+            if not df.empty:
+                return df
+
+        # 兜底源2: 腾讯财经 HTTP
+        if self._is_source_available("tencent"):
+            df = self._get_a_share_kline_tencent(symbol, days, adjust)
+            if not df.empty:
+                return df
+
+        # 兜底源3: 新浪财经 HTTP (仅不复权日线)
+        if self._is_source_available("sina"):
+            df = self._get_a_share_kline_sina(symbol, days)
             if not df.empty:
                 return df
 
