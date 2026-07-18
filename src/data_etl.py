@@ -923,6 +923,183 @@ class DataETL:
     # 涨停股获取 (只扫描涨停股, 数量少 ~20-100 只, 扫描极快)
     # ============================================================
 
+    def _get_trade_date_str(self) -> str:
+        """获取最近交易日的 YYYYMMDD 格式日期 (周末回溯到周五)"""
+        today = datetime.now()
+        if today.weekday() == 5:  # 周六
+            trade_date = today - timedelta(days=1)
+        elif today.weekday() == 6:  # 周日
+            trade_date = today - timedelta(days=2)
+        else:
+            trade_date = today
+        return trade_date.strftime("%Y%m%d")
+
+    def _get_zt_stock_list_ths(self) -> pd.DataFrame:
+        """
+        通过同花顺涨停揭秘 API 获取涨停股列表 (海外首选源)
+        API: data.10jqka.com.cn/dataapi/limit_up/limit_up_pool
+        零鉴权, 极低封IP风险, 单次请求返回全部涨停股+涨停原因
+
+        Returns: DataFrame[代码, 名称, 涨跌幅, 连板数, 涨停原因]
+        """
+        date_str = self._get_trade_date_str()
+        url = "https://data.10jqka.com.cn/dataapi/limit_up/limit_up_pool"
+        params = {
+            "page": 1,
+            "limit": 200,
+            "field": "199112,10,9001,330323,330324,330325,9002,330329,133971,133970,1968584,3475914,9003,9004",
+            "filter": "HS,GEM2STAR",
+            "order_field": "330324",
+            "order_type": "0",
+            "date": date_str,
+        }
+        try:
+            resp = requests.get(
+                url, params=params,
+                timeout=15,
+                headers={"User-Agent": random.choice(_USER_AGENTS)},
+                proxies={"http": None, "https": None},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            info = (data.get("data") or {}).get("info", [])
+
+            if not info:
+                logger.info("同花顺涨停揭秘: {} 无涨停股", date_str)
+                return pd.DataFrame()
+
+            rows = []
+            for item in info:
+                code = str(item.get("code", "")).strip()
+                name = item.get("name", "")
+                change_rate = item.get("change_rate", 0)
+                reason = item.get("reason_type", "")
+                high_days = item.get("high_days", "")
+                seal_amount = item.get("order_amount", 0)
+
+                if not code or not name:
+                    continue
+                if self._is_excluded_code(code):
+                    continue
+                if re.search(r"ST|退|B股", str(name)):
+                    continue
+
+                # 解析连板数 (high_days 格式如 "3天2板")
+                lbc = 0
+                if high_days and "板" in str(high_days):
+                    try:
+                        lbc = int(re.search(r"(\d+)板", str(high_days)).group(1))
+                    except (AttributeError, ValueError):
+                        pass
+
+                rows.append({
+                    "代码": code,
+                    "名称": name,
+                    "涨跌幅": float(change_rate) if change_rate else 0,
+                    "连板数": lbc,
+                    "涨停原因": reason,
+                })
+
+            if not rows:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(rows)
+            logger.info(
+                "同花顺涨停揭秘获取成功 | {} 涨停股: {} 只 (连板最高 {} 板)",
+                date_str, len(df), df["连板数"].max() if len(df) > 0 else 0,
+            )
+            self._mark_source_success("ths")
+            return df
+
+        except Exception as e:
+            logger.warning("同花顺涨停揭秘 API 失败: {}", e)
+            self._mark_source_fail("ths")
+            return pd.DataFrame()
+
+    def _get_zt_stock_list_tencent(self) -> pd.DataFrame:
+        """
+        通过腾讯财经批量行情 API 获取涨停股 (海外备用源)
+        API: qt.gtimg.cn/q={codes} (标注"不封IP", 支持100只/批)
+        策略: Baostock获取全市场代码 → 腾讯批量查涨跌幅 → 筛选>=9.7%
+
+        Returns: DataFrame[代码, 名称, 涨跌幅, 连板数]
+        """
+        # 1. 用 Baostock 获取全市场代码
+        df_list = self._get_a_share_stock_list_baostock()
+        if df_list.empty:
+            return pd.DataFrame()
+
+        df_list = df_list[~df_list["代码"].apply(self._is_excluded_code)].reset_index(drop=True)
+        logger.info("腾讯涨停扫描: {} 只待查询 (批量100只/请求)", len(df_list))
+
+        # 2. 构造腾讯格式代码
+        tencent_codes = []
+        for _, row in df_list.iterrows():
+            code = row["代码"]
+            if code.startswith("6"):
+                tencent_codes.append((f"sh{code}", code, row["名称"]))
+            else:
+                tencent_codes.append((f"sz{code}", code, row["名称"]))
+
+        # 3. 批量查询 (每批100只)
+        batch_size = 100
+        zt_rows = []
+        total = len(tencent_codes)
+        completed = 0
+
+        for i in range(0, total, batch_size):
+            batch = tencent_codes[i:i + batch_size]
+            codes_str = ",".join([b[0] for b in batch])
+            try:
+                resp = requests.get(
+                    f"https://qt.gtimg.cn/q={codes_str}",
+                    timeout=10,
+                    headers={"User-Agent": random.choice(_USER_AGENTS)},
+                    proxies={"http": None, "https": None},
+                )
+                if resp.status_code != 200:
+                    continue
+
+                data = resp.content.decode("gbk", errors="replace")
+                for line in data.strip().split(";"):
+                    if not line.strip() or "=" not in line or '"' not in line:
+                        continue
+                    try:
+                        key = line.split("=")[0].split("_")[-1]
+                        vals = line.split('"')[1].split("~")
+                        if len(vals) < 33:
+                            continue
+                        code = key[2:]
+                        name = vals[1]
+                        change_pct = float(vals[32]) if vals[32] else 0
+                        completed += 1
+
+                        if change_pct >= 9.7:
+                            if not self._is_excluded_code(code) and not re.search(r"ST|退|B股", name):
+                                zt_rows.append({
+                                    "代码": code,
+                                    "名称": name,
+                                    "涨跌幅": change_pct,
+                                    "连板数": 0,
+                                })
+                    except (ValueError, IndexError):
+                        pass
+            except Exception:
+                pass
+
+            if (i // batch_size + 1) % 10 == 0:
+                logger.info("腾讯扫描进度: {}/{} 批 | 涨停: {} 只", i // batch_size + 1, (total + batch_size - 1) // batch_size, len(zt_rows))
+
+        if not zt_rows:
+            logger.info("腾讯涨停扫描: 无涨停股")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(zt_rows)
+        df = df.sort_values("涨跌幅", ascending=False).reset_index(drop=True)
+        logger.info("腾讯涨停扫描完成 | 涨停 {} 只 (共查询 {} 只)", len(df), completed)
+        self._mark_source_success("tencent")
+        return df
+
     def _get_zt_stock_list_eastmoney(self) -> pd.DataFrame:
         """
         通过东方财富涨停板专用接口获取涨停股列表
@@ -931,16 +1108,7 @@ class DataETL:
 
         Returns: DataFrame[代码, 名称, 涨跌幅, 连板数]
         """
-        # 获取最近交易日
-        today = datetime.now()
-        # 周末回溯到周五
-        if today.weekday() == 5:  # 周六
-            trade_date = today - timedelta(days=1)
-        elif today.weekday() == 6:  # 周日
-            trade_date = today - timedelta(days=2)
-        else:
-            trade_date = today
-        date_str = trade_date.strftime("%Y%m%d")
+        date_str = self._get_trade_date_str()
 
         url = "https://push2ex.eastmoney.com/getTopicZTPool"
         params = {
@@ -1084,17 +1252,27 @@ class DataETL:
     def get_zt_stock_list(self) -> list:
         """
         获取涨停股列表 (只扫描涨停股)
-        故障切换: 东财涨停板API (1次请求, 秒级) → Baostock (50线程, 5-8分钟)
+        故障切换: 同花顺(零鉴权,不封IP) → 东财(有风控) → 腾讯(不封IP,批量扫描) → Baostock(慢兜底)
 
         Returns: [("a_share", code, name), ...]
         """
-        # 首选: 东财涨停板专用API (push2ex, 不同于push2, 可能不被海外风控)
+        # 首选: 同花顺涨停揭秘 (零鉴权, 极低封IP风险, 海外可用)
+        df = self._get_zt_stock_list_ths()
+        if not df.empty:
+            return [("a_share", row["代码"], row["名称"]) for _, row in df.iterrows()]
+
+        # 备用1: 东财涨停板API (可能被海外风控)
         if self._is_source_available("eastmoney"):
             df = self._get_zt_stock_list_eastmoney()
             if not df.empty:
                 return [("a_share", row["代码"], row["名称"]) for _, row in df.iterrows()]
 
-        # 兜底: Baostock 多线程查询 (50 workers)
+        # 备用2: 腾讯批量行情 (不封IP, 需Baostock获取代码列表)
+        df = self._get_zt_stock_list_tencent()
+        if not df.empty:
+            return [("a_share", row["代码"], row["名称"]) for _, row in df.iterrows()]
+
+        # 兜底: Baostock 多线程查询 (50 workers, 最慢)
         if self._is_source_available("baostock"):
             df = self._get_zt_stock_list_baostock()
             if not df.empty:
