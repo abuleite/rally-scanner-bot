@@ -353,7 +353,7 @@ def _send_data_failure_alert(market: str):
             f"**[数据源故障告警]**\n\n"
             f"时间: {now}\n"
             f"市场: {market}\n\n"
-            f"所有数据源 (AkShare + efinance) 均不可用, "
+            f"所有数据源 (同花顺涨停API + 腾讯财经HTTP + 新浪财经HTTP) 均不可用, "
             f"已重试 3 次仍失败。\n"
             f"本次扫描已跳过, 等待下次定时触发自动恢复。\n"
             f"请检查网络连接或数据源 API 状态。"

@@ -1,40 +1,22 @@
 # ============================================================
-# 主升浪加速行情自动扫描与决策 Bot 系统 - 依赖配置 v2.0
+# 主升浪加速行情自动扫描与决策 Bot 系统 - 依赖配置 v4.0
 # ============================================================
-# 数据获取层 (Data ETL) -- 主源 + 备用源故障切换
-# ------------------------------------------------------------
-baostock>=0.8.8           # A股数据 (TCP socket直连, 海外IP不被风控, GitHub Actions首选)
-                           # https://github.com/baostock/baostock
-akshare>=1.16.19          # A股/港股/期货/宏观数据 (免费无需Token)
-                           # https://github.com/akfamily/akshare (21.2k stars)
-efinance>=0.5.0           # A股备用数据源 (AkShare故障时自动切换)
-                           # https://github.com/Micro-sheep/efinance (2.3k stars)
-yfinance>=0.2.40          # 美股/全球市场数据 (Yahoo Finance API)
-                           # https://github.com/ranaroussi/yfinance (24.6k stars)
-requests>=2.31.0          # HTTP 请求库 (通知推送/API调用)
+# v4.0: 移除所有国内专用数据源, 全部改用腾讯/新浪 HTTP API
+# 确保 GitHub Actions 海外环境 100% 可用
+# ============================================================
 
-# 数据处理层
-# ------------------------------------------------------------
-pandas>=2.2.0             # 数据清洗/时序处理/指标计算基础
+# 数据获取层 (纯 HTTP, 不封 IP)
+requests>=2.31.0          # HTTP 请求 (腾讯财经 + 新浪财经 API)
+pandas>=2.2.0             # 数据清洗/时序处理/指标计算
 numpy>=1.26.0             # 数值计算
 
-# 技术指标计算层 (Quant Scanner)
-# ------------------------------------------------------------
-# ta 库: 纯 Pandas/NumPy 实现的轻量级技术指标库
-# 支持 MACD, RSI, Bollinger Bands, MA/EMA, OBV, ADX 等 40+ 指标
-# 无需编译 C 库, GitHub Actions 友好
-ta>=0.11.0                # https://github.com/bukosabino/ta (5.1k stars)
+# 技术指标计算
+ta>=0.11.0                # MACD/RSI/Bollinger/MA 等 40+ 指标 (纯 Python)
 
-# 通知推送层 (Notification Bot)
-# ------------------------------------------------------------
-# Server酱 / PushPlus / Telegram Bot API / 钉钉 / 企微 / Discord
-# 均通过 requests 直接调用 Webhook, 无需额外 SDK
-
-# 工具层
-# ------------------------------------------------------------
-python-dotenv>=1.0.0      # 环境变量管理 (.env 配置)
-loguru>=0.7.2             # 轻量级日志框架 (支持文件轮转)
-tabulate>=0.9.0           # 终端表格输出美化
-pytz>=2024.1              # 时区处理 (A股交易时间判断)
-pyyaml>=6.0               # YAML 解析 (GitHub Actions 配置验证)
-openpyxl>=3.1.0           # Excel 读写 (报告导出)
+# 通知推送 (通过 requests 直接调用 Webhook)
+python-dotenv>=1.0.0      # 环境变量管理
+loguru>=0.7.2             # 日志框架 (支持文件轮转)
+tabulate>=0.9.0           # 终端表格输出
+pytz>=2024.1              # 时区处理
+pyyaml>=6.0               # YAML 解析
+openpyxl>=3.1.0           # Excel 导出 (报告)
