@@ -1,15 +1,18 @@
 """
-主升浪加速行情自动扫描与决策 Bot - 主流水线编排器 v3.0
+主升浪加速行情自动扫描与决策 Bot - 主流水线编排器 v4.0
 ================================================
-三段式流水线: Data ETL (自愈) → Quant Scanner (四维硬核动量) → Notification Bot
+四段式流水线:
+  1. Data ETL (自愈 + 多数据源故障切换)
+  2. Momentum Scanner (四维硬核动量检测)
+  3. Multi-Factor Scorer (六因子评分 + 交易 Playbook)
+  4. Report Generator + Notification Bot (报告生成 + 多渠道推送)
 
-v3.0 新增 -- 24/7 无人值守自愈:
-  1. 交易日历判断 -- 非交易日自动跳过, 不浪费资源
-  2. 数据源故障切换 -- 主源失败自动切换备用源
-  3. 临时文件自动清理 -- 每次运行后清理过期 CSV/JSON/日志
-  4. 全局异常兜底 -- 单股异常不崩溃整条流水线
-  5. 内存自动回收 -- 批量处理后主动 GC
-  6. 磁盘空间检查 -- 空间不足时强制清理
+v4.0 新增:
+  - 基于踏空组合(ZH063783)的六因子评分模型 (行业40%+市值20%+趋势15%+动量10%+质量10%+仓位5%)
+  - HTML/Excel 双格式报告自动生成
+  - 交易 Playbook (入场/止损/仓位/出场条件)
+  - 因子雷达图可视化
+  - 四维动量 + 六因子双评分交叉验证
 
 部署方案:
   A. GitHub Actions Cron (零成本推荐)
@@ -42,6 +45,13 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from data_etl import DataETL
 from scanner import RallyScanner, MarketEnvironment
+from factors import MultiFactorScorer
+from report import (
+    generate_html_report,
+    generate_excel_report,
+    generate_markdown_summary,
+    print_to_console,
+)
 from notifier import Notifier
 from utils import (
     TradingCalendar,
@@ -79,7 +89,7 @@ def setup_logging():
 @safe_run
 def run_pipeline(force: bool = False, dry_run: bool = False):
     """
-    执行完整的三段式流水线
+    执行完整的四段式流水线
 
     Args:
         force: True=强制运行 (忽略交易日判断)
@@ -88,8 +98,8 @@ def run_pipeline(force: bool = False, dry_run: bool = False):
 
     start_time = time.time()
     logger.info("=" * 60)
-    logger.info("主升浪加速行情自动扫描系统 v3.0 启动")
-    logger.info("四维硬核动量 + 数据源自愈 + 自动清理")
+    logger.info("主升浪加速行情自动扫描系统 v4.0 启动")
+    logger.info("四维动量扫描 + 六因子评分 + 双模型交叉验证 + 报告生成")
     logger.info("=" * 60)
 
     # 读取配置
@@ -194,21 +204,68 @@ def run_pipeline(force: bool = False, dry_run: bool = False):
         return None
 
     # ============================================================
-    # Stage 2: Quant Scanner - 四维硬核动量扫描
+    # Stage 2a: Momentum Scanner - 四维硬核动量扫描
     # ============================================================
     logger.info("-" * 60)
-    logger.info("Stage 2: Quant Scanner - 四维硬核动量扫描")
+    logger.info("Stage 2a: Momentum Scanner - 四维硬核动量扫描")
     logger.info("-" * 60)
 
-    results = scanner.scan_batch(stock_data, market_env=market_env)
+    momentum_results = scanner.scan_batch(stock_data, market_env=market_env)
 
     # 统计
-    s_count = sum(1 for r in results if r.level == "S")
-    a_count = sum(1 for r in results if r.level == "A")
-    b_count = sum(1 for r in results if r.level == "B")
+    ms_count = sum(1 for r in momentum_results if r.level == "S")
+    ma_count = sum(1 for r in momentum_results if r.level == "A")
+    mb_count = sum(1 for r in momentum_results if r.level == "B")
     logger.info(
-        "扫描结果 | S级={} A级={} B级={} 总命中={}",
-        s_count, a_count, b_count, len(results),
+        "动量扫描结果 | S级={} A级={} B级={} 总命中={}",
+        ms_count, ma_count, mb_count, len(momentum_results),
+    )
+
+    # ============================================================
+    # Stage 2b: Multi-Factor Scorer - 六因子评分模型
+    # ============================================================
+    logger.info("-" * 60)
+    logger.info("Stage 2b: Multi-Factor Scorer - 六因子评分模型")
+    logger.info("-" * 60)
+
+    factor_scorer = MultiFactorScorer()
+
+    # 判断扫描范围: 动量命中的优先评分, 其余股票量太大则只在涨停股基础上评分
+    if scan_zt_only or len(stock_data) <= 200:
+        # 涨停股模式或数量不多: 对所有已获取 K 线的股票评分
+        factor_results = factor_scorer.score_batch(stock_data)
+    else:
+        # 数量多时: 只对动量命中和涨幅 > 5% 的股票评分
+        target_codes = set()
+        for r in momentum_results:
+            target_codes.add(r.code)
+        # 如果动量命中太少，至少取 Top100 涨幅最大的
+        if len(target_codes) < 50:
+            # 补充一些涨幅较大的股票
+            sorted_codes = sorted(
+                stock_data.keys(),
+                key=lambda c: float(stock_data[c]["data"]["close"].iloc[-1])
+                / float(stock_data[c]["data"]["close"].iloc[-2]) - 1
+                if len(stock_data[c]["data"]) >= 2 else 0,
+                reverse=True,
+            )
+            for code in sorted_codes:
+                if len(target_codes) >= 100:
+                    break
+                target_codes.add(code)
+
+        target_data = {c: stock_data[c] for c in target_codes if c in stock_data}
+        logger.info("精准评分: 动量命中+涨幅Top股票共 {} 只", len(target_data))
+        factor_results = factor_scorer.score_batch(target_data)
+
+    # 统计
+    fs_count = sum(1 for r in factor_results if r.level == "S")
+    fa_count = sum(1 for r in factor_results if r.level == "A")
+    fb_count = sum(1 for r in factor_results if r.level == "B")
+    fc_count = sum(1 for r in factor_results if r.level == "C")
+    logger.info(
+        "因子评分结果 | S级={} A级={} B级={} C级={} 总评估={}",
+        fs_count, fa_count, fb_count, fc_count, len(factor_results),
     )
 
     # 主动释放内存
@@ -216,14 +273,49 @@ def run_pipeline(force: bool = False, dry_run: bool = False):
     memory_cleanup()
 
     # ============================================================
-    # Stage 3: Notification Bot - 消息决策流发送
+    # Stage 3: Report Generator - HTML + Excel 报告
     # ============================================================
     logger.info("-" * 60)
-    logger.info("Stage 3: Notification Bot - 消息推送")
+    logger.info("Stage 3: Report Generator - 报告生成")
+    logger.info("-" * 60)
+
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    output_dir = os.path.join(project_root, "outputs")
+
+    html_path = generate_html_report(
+        factor_results, momentum_results, market_env, output_dir
+    )
+    excel_path = generate_excel_report(factor_results, market_env, output_dir)
+    markdown_summary = generate_markdown_summary(factor_results, market_env)
+
+    if html_path:
+        logger.info("HTML 报告: {}", html_path)
+    if excel_path:
+        logger.info("Excel 报表: {}", excel_path)
+
+    # 控制台输出
+    print_to_console(factor_results, market_env)
+
+    # ============================================================
+    # Stage 4: Notification Bot - 多渠道推送
+    # ============================================================
+    logger.info("-" * 60)
+    logger.info("Stage 4: Notification Bot - 消息推送")
     logger.info("-" * 60)
 
     notifier = Notifier()
-    notifier.notify(results, dry_run=dry_run, market_env=market_env, market=market)
+
+    # 推送动量扫描结果 (带决策卡片)
+    notifier.notify(momentum_results, dry_run=dry_run, market_env=market_env, market=market)
+
+    # 如果 PushPlus 可用，额外推送因子评分摘要
+    if not dry_run and notifier.pushplus_token:
+        try:
+            title = f"选股日报 {fa_count}S{fa_count}A{fb_count}B"
+            notifier._send_pushplus(title, markdown_summary)
+            logger.info("因子评分摘要已推送至 PushPlus")
+        except Exception as e:
+            logger.warning("因子评分摘要推送失败: {}", e)
 
     # ============================================================
     # Post-Run: 临时文件清理
@@ -235,7 +327,7 @@ def run_pipeline(force: bool = False, dry_run: bool = False):
     cleanup_temp_files(
         base_dir=project_root,
         max_age_days=7,
-        keep_patterns=["configs/*", "logs/dead_letter/**"],
+        keep_patterns=["configs/*", "logs/dead_letter/**", "outputs/**"],
     )
 
     # ============================================================
@@ -243,10 +335,13 @@ def run_pipeline(force: bool = False, dry_run: bool = False):
     # ============================================================
     elapsed = time.time() - start_time
     logger.info("=" * 60)
-    logger.info("流水线执行完成 | 耗时 {:.1f}s | 命中 {} 只", elapsed, len(results))
+    logger.info(
+        "流水线执行完成 | 耗时 {:.1f}s | 动量命中 {} 只 | 因子评估 {} 只",
+        elapsed, len(momentum_results), len(factor_results),
+    )
     logger.info("=" * 60)
 
-    return results
+    return {"momentum": momentum_results, "factor": factor_results}
 
 
 def _send_data_failure_alert(market: str):
@@ -282,7 +377,7 @@ def _send_data_failure_alert(market: str):
 def main():
     """CLI 入口"""
     parser = argparse.ArgumentParser(
-        description="主升浪加速行情自动扫描与决策 Bot v3.0",
+        description="主升浪加速行情自动扫描与决策 Bot v4.0",
     )
     parser.add_argument(
         "--force", action="store_true",

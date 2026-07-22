@@ -55,9 +55,9 @@ RUN mkdir -p /app/logs /app/logs/dead_letter /app/data
 # ============================================================
 # 容器内 Cron 定时任务配置
 # ============================================================
-# A股盘后扫描: 每个交易日 16:00 (北京时间)
-# 0 8 * * 1-5 = UTC 08:00 = 北京时间 16:00
-RUN echo '0 8 * * 1-5 cd /app && /usr/local/bin/python src/main.py >> /app/logs/cron.log 2>&1' > /etc/cron.d/scanner-cron && \
+# A股盘后扫描: 每个交易日 20:00 (北京时间)
+# 0 12 * * 1-5 = UTC 12:00 = 北京时间 20:00
+RUN echo '0 12 * * 1-5 cd /app && /usr/local/bin/python src/main.py >> /app/logs/cron.log 2>&1' > /etc/cron.d/scanner-cron && \
     chmod 0644 /etc/cron.d/scanner-cron && \
     crontab /etc/cron.d/scanner-cron && \
     touch /app/logs/cron.log

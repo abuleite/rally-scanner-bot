@@ -37,3 +37,4 @@ loguru>=0.7.2             # 轻量级日志框架 (支持文件轮转)
 tabulate>=0.9.0           # 终端表格输出美化
 pytz>=2024.1              # 时区处理 (A股交易时间判断)
 pyyaml>=6.0               # YAML 解析 (GitHub Actions 配置验证)
+openpyxl>=3.1.0           # Excel 读写 (报告导出)
