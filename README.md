@@ -1,198 +1,324 @@
-# 主升浪加速行情自动扫描与决策 Bot
+"""
+Data ETL - 涨停股专用数据抓取与清洗 (v4.1)
+================================================
+专为 GitHub Actions 海外环境设计，全部使用纯 HTTP 接口：
+  1. 东财涨停板池 (push2ex) - 秒级获取当日涨停股
+  2. 腾讯财经 K 线 (ifzq.gtimg) - 历史日线，海外稳定
+  3. 新浪财经 K 线备用
+  4. 沪深300指数 (腾讯)
 
-> 轻量级 · 零成本 · 24/7 无人值守的 A股/美股主升浪加速行情自动扫描系统
+设计原则：
+  - 绝不依赖需要登录/API Key 的库
+  - 任何数据源失败都优雅降级，返回空结果而不是崩溃
+  - 只扫涨停股，数量少，速度快 (通常 10-25 分钟)
+"""
 
-## 简介
+import time
+import random
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple, Optional
 
-基于 GitHub 开源生态构建的三段式流水线量化扫描系统，通过四维硬核动量模型精准识别主升浪加速行情，并通过多渠道 Webhook 推送含估值锚定和买卖决策手令的结构化卡片。
+import pandas as pd
+import requests
+from loguru import logger
 
-### 核心特性
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
 
-- **四维硬核动量模型** — 均线多头排列 + 放量突破 + VCP形态 + 大盘环境过滤
-- **数据源自愈** — AkShare↔efinance 自动故障切换，yfinance↔AkShare 美股备用
-- **决策卡片推送** — 每只牛股附带 Forward PE/PEG 估值 + 追击买点/回踩买点/止损线
-- **五渠道投递** — Telegram / 钉钉 / 企业微信 / Discord / Server酱(微信) 并行推送
-- **防漏报** — 指数退避重试(3次) + 死信队列持久化 + 多渠道并行任一成功即送达
-- **24/7 无人值守** — 交易日自动运行、非交易日自动跳过、临时文件自动清理
-- **零成本** — GitHub Actions 每月 2000 分钟免费额度，月消耗约 150 分钟
+EASTMONEY_ZT_UT = "7eea3edcaed734bea9cbfc24409ed989"
+REQUEST_TIMEOUT = 15
 
-## 架构
 
-```
-Data ETL (自愈) → Quant Scanner (四维硬核动量) → Notification Bot (决策卡片)
-```
+def _headers() -> dict:
+    return {
+        "User-Agent": random.choice(_USER_AGENTS),
+        "Referer": "https://quote.eastmoney.com/",
+        "Accept": "*/*",
+    }
 
-详见 [架构文档](docs/ARCHITECTURE.md)
 
-## 快速开始
+def _is_excluded(code: str, name: str = "") -> bool:
+    code = str(code).strip()
+    if code.startswith(("688", "8", "4")):
+        return True
+    if re.search(r"ST|退|B股|\*ST", str(name), re.IGNORECASE):
+        return True
+    return False
 
-### 1. 安装依赖
 
-```bash
-cd rally-scanner-bot
-pip install -r requirements.txt
-```
+def _to_tencent_code(code: str) -> str:
+    code = str(code).strip()
+    if code.startswith(("sh", "sz")):
+        return code
+    if code.startswith("6"):
+        return f"sh{code}"
+    return f"sz{code}"
 
-### 2. 配置通知 Token
 
-```bash
-cp configs/config.example.env configs/.env
-# 编辑 .env, 填入至少一个通知渠道的 Token
-```
+def _trade_date_str() -> str:
+    today = datetime.now()
+    if today.weekday() == 5:
+        today -= timedelta(days=1)
+    elif today.weekday() == 6:
+        today -= timedelta(days=2)
+    return today.strftime("%Y%m%d")
 
-### 3. 运行扫描
 
-```bash
-cd src
+class DataETL:
+    def __init__(self, market: str = "a_share"):
+        self.market = market
+        self._fail_counts = {"eastmoney": 0, "tencent": 0, "sina": 0}
+        self._FAIL_THRESHOLD = 3
 
-# 正常运行 (交易日自动判断)
-python main.py
+    def _mark_fail(self, source: str):
+        self._fail_counts[source] = self._fail_counts.get(source, 0) + 1
+        if self._fail_counts[source] >= self._FAIL_THRESHOLD:
+            logger.warning("数据源 {} 连续失败 {} 次, 暂时降级", source, self._fail_counts[source])
 
-# 强制运行 (忽略交易日判断)
-python main.py --force
+    def _mark_ok(self, source: str):
+        self._fail_counts[source] = 0
 
-# 仅扫描不推送 (测试用)
-python main.py --dry-run
+    def _available(self, source: str) -> bool:
+        return self._fail_counts.get(source, 0) < self._FAIL_THRESHOLD
 
-# 数据源健康检查
-python main.py --health-check
+    def _get_zt_pool_eastmoney(self) -> List[Tuple[str, str, str]]:
+        date_str = _trade_date_str()
+        url = "https://push2ex.eastmoney.com/getTopicZTPool"
+        params = {
+            "ut": EASTMONEY_ZT_UT,
+            "dpt": "wz.ztzt",
+            "Pageindex": "0",
+            "pagesize": "500",
+            "sort": "fbt:asc",
+            "date": date_str,
+        }
+        try:
+            resp = requests.get(url, params=params, headers=_headers(), timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            pool = (data.get("data") or {}).get("pool") or []
+            if not pool:
+                logger.info("东财涨停板: {} 无数据 (可能非交易日)", date_str)
+                return []
 
-# 仅清理临时文件
-python main.py --cleanup-only
-```
+            results = []
+            max_lb = 0
+            for item in pool:
+                code = str(item.get("c", "")).strip()
+                name = str(item.get("n", "")).strip()
+                if not code or not name or _is_excluded(code, name):
+                    continue
+                lb = int(item.get("lbc") or 0)
+                max_lb = max(max_lb, lb)
+                results.append(("a_share", code, name))
 
-## 部署方案
+            logger.info("东财涨停板获取成功 | {} | 涨停股 {} 只 (最高连板 {} 板)", date_str, len(results), max_lb)
+            self._mark_ok("eastmoney")
+            return results
+        except Exception as e:
+            logger.warning("东财涨停板失败: {}", e)
+            self._mark_fail("eastmoney")
+            return []
 
-### 方案 A: GitHub Actions (零成本推荐)
+    def get_zt_stock_list(self) -> List[Tuple[str, str, str]]:
+        if self._available("eastmoney"):
+            lst = self._get_zt_pool_eastmoney()
+            if lst:
+                return lst
+        logger.error("获取涨停股列表失败 (所有数据源均不可用)")
+        return []
 
-1. **Fork 或推送** 本项目到你的 GitHub 仓库
+    def get_stock_list(self, min_change_pct: float = 5.0, zt_only: bool = True) -> List[Tuple[str, str, str]]:
+        if zt_only:
+            return self.get_zt_stock_list()
+        logger.info("当前仅支持涨停股模式，自动切换为 zt_only")
+        return self.get_zt_stock_list()
 
-2. **配置 Secrets**: 仓库 Settings → Secrets and variables → Actions → New repository secret
+    def get_market_index(self, days: int = 200) -> pd.DataFrame:
+        try:
+            url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+            params = {"param": f"sh000300,day,,,{days * 2},"}
+            resp = requests.get(url, params=params, headers=_headers(), timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            stock_data = data.get("data", {}).get("sh000300", {})
+            klines = stock_data.get("day") or stock_data.get("qfqday") or []
+            if not klines:
+                logger.warning("腾讯沪深300返回空")
+                return pd.DataFrame()
 
-   | Secret 名称 | 说明 | 必填 |
-   |-------------|------|------|
-   | `TELEGRAM_BOT_TOKEN` | Telegram Bot Token | 至少配一个 |
-   | `TELEGRAM_CHAT_ID` | Telegram Chat ID | |
-   | `DINGTALK_WEBHOOK` | 钉钉机器人 Webhook URL | |
-   | `DINGTALK_SECRET` | 钉钉加签密钥 | |
-   | `WECOM_WEBHOOK` | 企业微信群机器人 Webhook | |
-   | `DISCORD_WEBHOOK` | Discord Webhook URL | |
-   | `SC_KEY` | Server酱 Key (微信) | |
-   | `PUSHPLUS_TOKEN` | PushPlus Token (微信) | |
+            rows = []
+            for k in klines:
+                if len(k) < 6:
+                    continue
+                rows.append({
+                    "date": k[0],
+                    "open": float(k[1]),
+                    "close": float(k[2]),
+                    "high": float(k[3]),
+                    "low": float(k[4]),
+                    "volume": float(k[5]),
+                })
+            df = pd.DataFrame(rows)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date").reset_index(drop=True).tail(days)
+            logger.info("沪深300指数获取成功 (腾讯) | {} 日", len(df))
+            self._mark_ok("tencent")
+            return df
+        except Exception as e:
+            logger.warning("获取大盘指数失败: {}", e)
+            self._mark_fail("tencent")
+            return pd.DataFrame()
 
-3. **自动运行**: 每个交易日 16:00 (北京时间) 自动扫描并推送
+    def _kline_tencent(self, code: str, days: int = 120) -> pd.DataFrame:
+        tcode = _to_tencent_code(code)
+        url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+        params = {"param": f"{tcode},day,,,{days * 2},qfq"}
+        try:
+            resp = requests.get(url, params=params, headers=_headers(), timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            stock_data = data.get("data", {}).get(tcode, {})
+            klines = stock_data.get("qfqday") or stock_data.get("day") or []
+            if not klines:
+                return pd.DataFrame()
 
-4. **手动触发**: Actions → 选择工作流 → Run workflow → 可选市场/模式/强制运行
+            rows = []
+            for k in klines:
+                if len(k) < 6:
+                    continue
+                rows.append({
+                    "date": k[0],
+                    "open": float(k[1]),
+                    "close": float(k[2]),
+                    "high": float(k[3]),
+                    "low": float(k[4]),
+                    "volume": float(k[5]),
+                    "amount": float(k[6]) if len(k) > 6 else 0.0,
+                })
+            df = pd.DataFrame(rows)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date").reset_index(drop=True).tail(days)
+            self._mark_ok("tencent")
+            return df
+        except Exception as e:
+            logger.debug("腾讯K线 {} 失败: {}", code, e)
+            self._mark_fail("tencent")
+            return pd.DataFrame()
 
-### 方案 B: Docker 部署 (轻量云服务器)
+    def _kline_sina(self, code: str, days: int = 120) -> pd.DataFrame:
+        scode = _to_tencent_code(code)
+        url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+        params = {"symbol": scode, "scale": "240", "datalen": str(days * 2), "ma": "no"}
+        try:
+            resp = requests.get(url, params=params, headers=_headers(), timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            klines = resp.json()
+            if not klines:
+                return pd.DataFrame()
+            rows = []
+            for item in klines:
+                rows.append({
+                    "date": item.get("day", ""),
+                    "open": float(item.get("open", 0)),
+                    "high": float(item.get("high", 0)),
+                    "low": float(item.get("low", 0)),
+                    "close": float(item.get("close", 0)),
+                    "volume": float(item.get("volume", 0)),
+                    "amount": 0.0,
+                })
+            df = pd.DataFrame(rows)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date").reset_index(drop=True).tail(days)
+            self._mark_ok("sina")
+            return df
+        except Exception as e:
+            logger.debug("新浪K线 {} 失败: {}", code, e)
+            self._mark_fail("sina")
+            return pd.DataFrame()
 
-```bash
-# 1. 准备配置
-cp configs/config.example.env configs/.env
-# 编辑 .env 填入 Token
+    def get_kline(self, mtype: str, code: str, days: int = 120) -> pd.DataFrame:
+        if mtype != "a_share":
+            return pd.DataFrame()
+        if self._available("tencent"):
+            df = self._kline_tencent(code, days)
+            if not df.empty:
+                return df
+        if self._available("sina"):
+            df = self._kline_sina(code, days)
+            if not df.empty:
+                return df
+        return pd.DataFrame()
 
-# 2. 一键启动 (24/7 守护进程)
-docker-compose up -d
+    def get_a_share_kline(self, symbol: str, days: int = 120, adjust: str = "qfq") -> pd.DataFrame:
+        return self.get_kline("a_share", symbol, days)
 
-# 3. 查看日志
-docker-compose logs -f scanner
+    def batch_fetch(
+        self,
+        stock_list: List[Tuple[str, str, str]],
+        days: int = 120,
+        rate_limit: float = 0.1,
+        max_workers: int = 4,
+    ) -> Dict[str, Dict]:
+        results: Dict[str, Dict] = {}
+        total = len(stock_list)
+        if total == 0:
+            return results
 
-# 4. 手动触发单次扫描
-docker-compose run --rm scanner python src/main.py --force
+        actual_workers = min(max_workers, total)
+        logger.info("开始多线程抓取K线 | {} 只股票, {} 线程, {} 天", total, actual_workers, days)
 
-# 5. 停止
-docker-compose down
-```
+        def _fetch_one(item):
+            mtype, code, name = item
+            try:
+                time.sleep(random.uniform(0.15, 0.45))
+                df = self.get_kline(mtype, code, days)
+                if not df.empty and len(df) >= 60:
+                    return code, {"data": df, "name": name, "market": mtype}
+            except Exception as e:
+                logger.debug("抓取 {} 异常: {}", code, e)
+            return code, None
 
-容器内 cron 定时: 每个交易日 16:00 (北京时间) 自动运行。
+        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+            futures = {executor.submit(_fetch_one, item): item for item in stock_list}
+            completed = 0
+            for fut in as_completed(futures):
+                completed += 1
+                try:
+                    code, result = fut.result(timeout=40)
+                    if result is not None:
+                        results[code] = result
+                except Exception as e:
+                    logger.warning("任务异常: {}", e)
 
-### 方案 C: 本地 crontab
+                if completed % 20 == 0 or completed == total:
+                    logger.info(
+                        "数据抓取进度: {}/{} ({:.0f}%) | 成功: {}",
+                        completed, total, completed / total * 100, len(results),
+                    )
 
-```bash
-# 编辑 crontab
-crontab -e
+        logger.info("数据抓取完成 | 成功: {}/{}", len(results), total)
+        return results
 
-# 添加: 每个交易日 16:00 运行
-0 16 * * 1-5 cd /path/to/rally-scanner-bot && /usr/bin/python3 src/main.py >> logs/cron.log 2>&1
-```
 
-## 环境变量
-
-### 必须配置 (至少一个通知渠道)
-
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `MARKET` | `a_share` | 扫描市场: `a_share` / `us_stock` / `all` |
-| `SCAN_SCOPE` | `all` | 扫描范围: `all`(全市场) / `custom`(自定义池) |
-| `CUSTOM_STOCKS` | `000001,600519` | 自定义股票池 (逗号分隔) |
-| `RUN_MODE` | `notify` | 运行模式: `dry_run` / `notify` |
-
-### 通知渠道 (至少配置一个)
-
-| 变量名 | 说明 |
-|--------|------|
-| `TELEGRAM_BOT_TOKEN` | Telegram Bot Token |
-| `TELEGRAM_CHAT_ID` | Telegram Chat ID |
-| `DINGTALK_WEBHOOK` | 钉钉机器人 Webhook URL |
-| `DINGTALK_SECRET` | 钉钉加签密钥 (可选) |
-| `WECOM_WEBHOOK` | 企业微信群机器人 Webhook |
-| `DISCORD_WEBHOOK` | Discord Webhook URL |
-| `SC_KEY` | Server酱 Key |
-| `PUSHPLUS_TOKEN` | PushPlus Token |
-
-### 策略参数 (可选调整)
-
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `VOLUME_SURGE_RATIO` | `2.0` | 放量倍数阈值 |
-| `VCP_CONTRACTION_THRESHOLD` | `1.3` | VCP振幅收敛比 |
-| `BOLLINGER_EXPLODE_RATIO` | `1.5` | 布林带开口放大倍数 |
-| `CANDLE_BODY_MIN_PCT` | `3.0` | 突破大阳线最低涨幅% |
-| `WEBHOOK_MAX_RETRIES` | `3` | Webhook重试次数 |
-| `WEBHOOK_RETRY_DELAY` | `1.0` | 重试基础延迟(秒) |
-
-## 四维硬核动量模型
-
-| 维度 | 条件 | 检测目标 |
-|------|------|---------|
-| ① 均线完美多头排列 | Price > MA5 > MA10 > MA20 > MA60 且 MA20 > MA60 > MA120 | 趋势确认 |
-| ② 动量爆发与放量破局 | 创20/60日新高 + 量比5d>2.0x 且 量比20d>2.0x | 真金白银突破 |
-| ③ VCP波动率收敛后突破 | 10日振幅收敛 + 大阳线(>3%) + 布林扩张(>1.5x) | 形态确认 |
-| ④ 大盘环境过滤器 | 指数>MA20做多 / <MA20>MA60谨慎 / <MA20<MA60空仓熔断 | 系统性风险防御 |
-
-信号等级: S级(做多+四维全通) / A级(谨慎+四维全通) / B级(部分通过)
-
-> ⚠️ 量化信号扫描结果，不构成投资建议。
-
-## 项目结构
-
-```
-rally-scanner-bot/
-├── src/
-│   ├── data_etl.py          # Stage 1: 数据抓取 (自愈故障切换)
-│   ├── scanner.py           # Stage 2: 四维硬核动量扫描引擎
-│   ├── notifier.py          # Stage 3: 决策卡片 + 多渠道推送
-│   ├── main.py              # 主流水线编排器 (24/7 自愈)
-│   └── utils.py             # 自愈工具: 交易日历/清理/健康检查
-├── configs/
-│   └── config.example.env   # 配置模板
-├── .github/workflows/
-│   └── run_scanner.yml      # GitHub Actions 定时任务
-├── docs/
-│   └── ARCHITECTURE.md      # 架构文档
-├── docker-compose.yml       # Docker 一键部署
-├── docker-entrypoint.sh     # 容器入口脚本
-├── Dockerfile               # Docker 构建
-├── requirements.txt         # Python 依赖
-├── .gitignore
-└── README.md
-```
-
-## 核心开源依赖
-
-| 库 | Stars | 用途 |
-|----|-------|------|
-| [akshare](https://github.com/akfamily/akshare) | 21.2k | A股数据 (主源) |
-| [efinance](https://github.com/Micro-sheep/efinance) | 2.3k | A股数据 (备用源) |
-| [yfinance](https://github.com/ranaroussi/yfinance) | 24.6k | 美股数据 (主源) |
-| [ta](https://github.com/bukosabino/ta) | 5.1k | 技术指标计算 |
+def health_check(market: str = "a_share") -> Dict[str, Dict]:
+    out = {}
+    for s in ["eastmoney", "tencent", "sina"]:
+        out[s] = {"available": True, "latency_ms": 0, "error": ""}
+    try:
+        r = requests.get(
+            "https://push2ex.eastmoney.com/getTopicZTPool",
+            params={"ut": EASTMONEY_ZT_UT, "dpt": "wz.ztzt", "Pageindex": 0, "pagesize": 1, "date": _trade_date_str()},
+            headers=_headers(),
+            timeout=8,
+        )
+        out["eastmoney"]["available"] = r.status_code == 200
+    except Exception as e:
+        out["eastmoney"] = {"available": False, "latency_ms": 0, "error": str(e)[:80]}
+    return out
